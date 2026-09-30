@@ -12,9 +12,9 @@
     </parent>
 
     <groupId>com.example</groupId>
-    <artifactId>hello.app</artifactId>
+    <artifactId>eks_deploy_sample</artifactId>
     <version>0.0.1</version>
-    <name>hello.app</name>
+    <name>eks_deploy_sample</name>
 
     <properties>
         <java.version>21</java.version>
@@ -32,7 +32,7 @@
     </dependencies>
 
     <build>
-        <finalName>hello.app</finalName>
+        <finalName>eks_deploy_sample</finalName>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>

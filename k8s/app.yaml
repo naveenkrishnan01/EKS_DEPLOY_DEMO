@@ -1,34 +1,34 @@
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: hello-app
-spec:
-  replicas: 2
-  selector:
-    matchLabels: { app: hello-app }
-  template:
-    metadata:
-      labels: { app: hello-app }
-    spec:
-      containers:
-        - name: hello-app
-          image: IMAGE_URI
-          ports: [{ containerPort: 8080 }]
-          resources:
-            requests: { cpu: "250m", memory: "512Mi" }
-            limits:   { memory: "768Mi" }
-          readinessProbe:
-            httpGet: { path: /actuator/health/readiness, port: 8080 }
-            initialDelaySeconds: 20
-          livenessProbe:
-            httpGet: { path: /actuator/health/liveness, port: 8080 }
-            initialDelaySeconds: 40
+apiVersion: apps/v1                     # API group/version for Deployments
+kind: Deployment                        # Manages a replicated set of pods
+metadata:                               # Deployment identity
+  name: eks-deploy-sample                       # Deployment name
+spec:                                   # Desired state
+  replicas: 2                           # Run two pods
+  selector:                             # How the Deployment finds its pods
+    matchLabels: { app: eks-deploy-sample }     # Match pods labeled app=eks-deploy-sample
+  template:                             # Pod template
+    metadata:                           # Pod metadata
+      labels: { app: eks-deploy-sample }        # Label that the selector matches
+    spec:                               # Pod spec
+      containers:                       # Containers in the pod
+        - name: eks-deploy-sample               # Container name
+          image: IMAGE_URI              # Placeholder replaced with the ECR image at deploy time
+          ports: [{ containerPort: 8080 }]  # Spring Boot listens on 8080
+          resources:                    # CPU/memory sizing
+            requests: { cpu: "250m", memory: "512Mi" }  # Guaranteed minimum for scheduling
+            limits:   { memory: "768Mi" }  # Memory cap on pod
+          readinessProbe:               # Gate traffic until app is ready
+            httpGet: { path: /actuator/health/readiness, port: 8080 }  # Actuator readiness endpoint
+            initialDelaySeconds: 20     # Wait 20s before first check
+          livenessProbe:                # Restart container if unhealthy
+            httpGet: { path: /actuator/health/liveness, port: 8080 }  # Actuator liveness endpoint
+            initialDelaySeconds: 40     # Wait 40s before first check
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: hello-app-svc
-spec:
-  type: LoadBalancer
-  selector: { app: hello-app }
-  ports: [{ port: 80, targetPort: 8080 }]
+apiVersion: v1                          # Core API version for Services
+kind: Service                           # Stable network endpoint for the pods
+metadata:                               # Service identity
+  name: eks-deploy-sample-svc                   # Service name
+spec:                                   # Desired state
+  type: LoadBalancer                    # Provision an AWS load balancer
+  selector: { app: eks-deploy-sample }          # Route to pods labeled app=eks-deploy-sample
+  ports: [{ port: 80, targetPort: 8080 }]  # Expose port 80, forward to container 8080

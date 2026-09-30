@@ -1,4 +1,4 @@
-# hello.app — Spring Boot on Amazon EKS
+# eks_deploy_sample — Spring Boot on Amazon EKS
 
 A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Service), end to end:
 
@@ -11,13 +11,13 @@ A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Ser
 7. Tear everything down
 
 ```
- Mac (build)                AWS (us-west-1)
- ┌──────────────┐  push   ┌──────────┐  pull   ┌──────────────────── EKS cluster ─────────────┐
- │ mvn + docker │ ──────▶ │   ECR    │ ──────▶ │  Deployment: hello-app (2 pods)               │
- └──────────────┘         │hello-app │         │         ▲                                     │
-                          └──────────┘         │  Service: hello-app-svc (LoadBalancer :80)    │
-                                               └─────────┼─────────────────────────────────────┘
-                                          curl http://<elb-hostname>/hello
+ Mac (build)              AWS (us-west-1)
+ ┌──────────────┐  push   ┌───────────────────┐  pull   ┌──────────────────── EKS cluster ─────────────────────┐
+ │ mvn + docker │ ──────▶ │        ECR        │ ──────▶ │  Deployment: eks-deploy-sample (2 pods)              │
+ └──────────────┘         │ eks-deploy-sample │         │            ▲                                         │
+                          └───────────────────┘         │  Service: eks-deploy-sample-svc (LoadBalancer :80)   │
+                                                        └────────────┼─────────────────────────────────────────┘
+                                                     curl http://<elb-hostname>/hello
 ```
 
 ---
@@ -56,16 +56,16 @@ A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Ser
 ## Project structure
 
 ```
-hello_2.app/
+eks_deploy_sample/
 ├── Dockerfile
 ├── pom.xml
 ├── k8s/
 │   └── app.yaml                  # Deployment + LoadBalancer Service
 └── src/main/
-    ├── java/com/example/hello/
-    │   └── HelloApplication.java # /hello endpoint
+    ├── java/com/example/eksdeploysample/
+    │   └── EksDeploySampleApplication.java # /hello endpoint
     └── resources/
-        └── application.properties
+        └── application.yml
 ```
 
 ---
@@ -118,15 +118,15 @@ aws sts get-caller-identity   # ARN should end in user/naveen-admin, not root
 </dependencies>
 ```
 
-**`HelloApplication.java`** — returns a message, a version, and the pod's hostname, so you can see which replica answered:
+**`EksDeploySampleApplication.java`** — returns a message, a version, and the pod's hostname, so you can see which replica answered:
 
 ```java
 @SpringBootApplication
 @RestController
-public class HelloApplication {
+public class EksDeploySampleApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(HelloApplication.class, args);
+        SpringApplication.run(EksDeploySampleApplication.class, args);
     }
 
     @GetMapping("/hello")
@@ -139,21 +139,31 @@ public class HelloApplication {
 }
 ```
 
-**`application.properties`** — turns on separate liveness/readiness endpoints for Kubernetes:
+**`application.yml`** — turns on separate liveness/readiness endpoints for Kubernetes:
 
-```properties
-spring.application.name=hello.app
-server.port=8080
-management.endpoint.health.probes.enabled=true
-management.endpoints.web.exposure.include=health,info
-server.shutdown=graceful
+```yaml
+spring:
+  application:
+    name: eks_deploy_sample                   # App name used in logs and actuator info
+server:
+  port: 8080                          # HTTP port (matches containerPort in k8s/app.yaml)
+  shutdown: graceful                  # Finish in-flight requests before shutting down on pod termination
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true                 # Separate liveness/readiness endpoints for Kubernetes probes
+  endpoints:
+    web:
+      exposure:
+        include: health,info          # Expose only health and info actuator endpoints over HTTP
 ```
 
 **Build and run locally:**
 
 ```bash
 mvn clean package -DskipTests
-java -jar target/hello.app.jar
+java -jar target/eks_deploy_sample.jar
 
 # in another terminal
 curl localhost:8080/hello
@@ -185,7 +195,7 @@ Set these once per terminal session. Every later command uses them:
 ```bash
 export AWS_REGION=us-west-1
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export REPO=hello-app
+export REPO=eks-deploy-sample
 export IMAGE_BASE=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO
 echo $IMAGE_BASE    # must NOT be blank
 ```
@@ -262,40 +272,40 @@ aws eks update-kubeconfig --name demo-cluster --region $AWS_REGION
 **`k8s/app.yaml`:**
 
 ```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: hello-app
-spec:
-  replicas: 2
-  selector:
-    matchLabels: { app: hello-app }
-  template:
-    metadata:
-      labels: { app: hello-app }
-    spec:
-      containers:
-        - name: hello-app
-          image: IMAGE_URI
-          ports: [{ containerPort: 8080 }]
-          resources:
-            requests: { cpu: "250m", memory: "512Mi" }
-            limits:   { memory: "768Mi" }
-          readinessProbe:
-            httpGet: { path: /actuator/health/readiness, port: 8080 }
-            initialDelaySeconds: 20
-          livenessProbe:
-            httpGet: { path: /actuator/health/liveness, port: 8080 }
-            initialDelaySeconds: 40
+apiVersion: apps/v1                     # API group/version for Deployments
+kind: Deployment                        # Manages a replicated set of pods
+metadata:                               # Deployment identity
+  name: eks-deploy-sample                       # Deployment name
+spec:                                   # Desired state
+  replicas: 2                           # Run two pods
+  selector:                             # How the Deployment finds its pods
+    matchLabels: { app: eks-deploy-sample }     # Match pods labeled app=eks-deploy-sample
+  template:                             # Pod template
+    metadata:                           # Pod metadata
+      labels: { app: eks-deploy-sample }        # Label that the selector matches
+    spec:                               # Pod spec
+      containers:                       # Containers in the pod
+        - name: eks-deploy-sample               # Container name
+          image: IMAGE_URI              # Placeholder replaced with the ECR image at deploy time
+          ports: [{ containerPort: 8080 }]  # Spring Boot listens on 8080
+          resources:                    # CPU/memory sizing
+            requests: { cpu: "250m", memory: "512Mi" }  # Guaranteed minimum for scheduling
+            limits:   { memory: "768Mi" }  # Memory cap on pod
+          readinessProbe:               # Gate traffic until app is ready
+            httpGet: { path: /actuator/health/readiness, port: 8080 }  # Actuator readiness endpoint
+            initialDelaySeconds: 20     # Wait 20s before first check
+          livenessProbe:                # Restart container if unhealthy
+            httpGet: { path: /actuator/health/liveness, port: 8080 }  # Actuator liveness endpoint
+            initialDelaySeconds: 40     # Wait 40s before first check
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: hello-app-svc
-spec:
-  type: LoadBalancer
-  selector: { app: hello-app }
-  ports: [{ port: 80, targetPort: 8080 }]
+apiVersion: v1                          # Core API version for Services
+kind: Service                           # Stable network endpoint for the pods
+metadata:                               # Service identity
+  name: eks-deploy-sample-svc                   # Service name
+spec:                                   # Desired state
+  type: LoadBalancer                    # Provision an AWS load balancer
+  selector: { app: eks-deploy-sample }          # Route to pods labeled app=eks-deploy-sample
+  ports: [{ port: 80, targetPort: 8080 }]  # Expose port 80, forward to container 8080
 ```
 
 What each part does:
@@ -309,13 +319,13 @@ What each part does:
 | `livenessProbe` | Kubernetes restarts the container if `/actuator/health/liveness` fails |
 | `Service` (`LoadBalancer`) | AWS creates a public load balancer: port 80 → pod port 8080 |
 
-> Kubernetes resource and container names can't contain dots, so the manifest uses `hello-app` even though the project is `hello.app`.
+> Kubernetes resource and container names can't contain underscores, so the manifest uses `eks-deploy-sample` even though the project is `eks_deploy_sample`.
 
 **Deploy**, substituting the image address:
 
 ```bash
 sed "s|IMAGE_URI|$IMAGE_BASE:v1|" k8s/app.yaml | kubectl apply -f -
-kubectl rollout status deployment/hello-app
+kubectl rollout status deployment/eks-deploy-sample
 kubectl get pods
 ```
 
@@ -326,7 +336,7 @@ Both pods should reach `1/1 Running` within about 1–2 minutes.
 ## Step 7 — Test v1
 
 ```bash
-export URL=$(kubectl get svc hello-app-svc \
+export URL=$(kubectl get svc eks-deploy-sample-svc \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 echo $URL
 curl http://$URL/hello
@@ -335,7 +345,7 @@ curl http://$URL/hello
 Expected response:
 
 ```json
-{"message":"Hello from EKS","version":"v1","pod":"hello-app-cc445fbd6-4pzg7"}
+{"message":"Hello from EKS","version":"v1","pod":"eks-deploy-sample-cc445fbd6-4pzg7"}
 ```
 
 - The first `curl` can fail for 2–3 minutes while the load balancer's DNS name starts resolving.
@@ -345,7 +355,7 @@ Expected response:
 
 ## Step 8 — Roll out v2
 
-**1. Change the code** in `HelloApplication.java`:
+**1. Change the code** in `EksDeploySampleApplication.java`:
 
 ```java
 "message", "Hello from EKS - updated!",
@@ -363,8 +373,8 @@ docker push $IMAGE_BASE:v2
 **3. Point the Deployment at v2:**
 
 ```bash
-kubectl set image deployment/hello-app hello-app=$IMAGE_BASE:v2
-kubectl rollout status deployment/hello-app
+kubectl set image deployment/eks-deploy-sample eks-deploy-sample=$IMAGE_BASE:v2
+kubectl rollout status deployment/eks-deploy-sample
 ```
 
 **4. Watch the switch live.** In a second terminal (set `URL` there too), start this *before* step 3:
@@ -378,8 +388,8 @@ Responses flip from `v1` to `v2` with no failed requests. This is a **rolling up
 **Roll back** if v2 misbehaves:
 
 ```bash
-kubectl rollout undo deployment/hello-app
-kubectl rollout history deployment/hello-app
+kubectl rollout undo deployment/eks-deploy-sample
+kubectl rollout history deployment/eks-deploy-sample
 ```
 
 > Always push a **new tag** for each release (`v1`, `v2`, …). Reusing a tag makes rollouts and rollbacks unreliable.
@@ -454,12 +464,12 @@ Our root cause: `RunInstances → "The specified instance type is not eligible f
 ### Pods show `InvalidImageName`
 The image address was blank because `$IMAGE_BASE` wasn't set in the current terminal. Check it:
 ```bash
-kubectl get deployment hello-app -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+kubectl get deployment eks-deploy-sample -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
 ```
 Re-export the variables (Step 4) and re-run the `sed ... | kubectl apply` command.
 
 ### Pods show `ErrImagePull` / `ImagePullBackOff`
-The address is valid, but the tag isn't in ECR. Confirm with `aws ecr list-images --repository-name hello-app`, push the missing tag, then force an immediate retry:
+The address is valid, but the tag isn't in ECR. Confirm with `aws ecr list-images --repository-name eks-deploy-sample`, push the missing tag, then force an immediate retry:
 ```bash
 kubectl delete pod <pod-name>
 ```
@@ -474,7 +484,7 @@ kubectl get events --sort-by=.lastTimestamp     # cluster-wide recent events
 
 ---
 
-## Next steps
+## Next things to do
 
 - **AWS Load Balancer Controller + Ingress** — an ALB with path-based routing and HTTPS
 - **CI/CD** — a GitHub Actions workflow that builds, pushes and deploys on every commit

@@ -1,4 +1,4 @@
-package com.example.hello;
+package com.example.eksdeploysample;
 
 import java.net.InetAddress;
 import java.util.Map;
@@ -10,10 +10,10 @@ import org.springframework.web.bind.annotation.RestController;
 
 @SpringBootApplication
 @RestController
-public class HelloApplication {
+public class EksDeploySampleApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(HelloApplication.class, args);
+        SpringApplication.run(EksDeploySampleApplication.class, args);
     }
 
     // Returns the pod name so you can see the load balancer spreading requests across replicas
