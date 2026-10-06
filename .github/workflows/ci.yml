@@ -1,0 +1,26 @@
+# CI: runs on every pull request to main. Builds, tests, and builds the Docker image.
+# Nothing is pushed or deployed. Make this check required before merging (branch protection).
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15                           # Fail instead of hanging
+    steps:
+      - uses: actions/checkout@v4                 # Get the PR's code
+
+      - uses: actions/setup-java@v4               # Install Java 21 and cache Maven downloads
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and test
+        run: mvn -B clean verify                  # Compile, run the tests, and build the jar
+
+      - name: Build Docker image
+        run: docker build --platform linux/amd64 -t eks-deploy-sample:pr .  # Make sure the Dockerfile still builds

@@ -1,0 +1,82 @@
+# CD: runs on every push (merged PR) to main. Assumes the EKS cluster is already running.
+# Builds and pushes the image tagged with the commit ID, deploys it, and smoke tests it.
+# On any failure or timeout: rolls back the deployment and emails an alert through SNS.
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write                                 # Needed to log in to AWS with OIDC (no stored keys)
+  contents: read
+
+concurrency:
+  group: deploy-prod                              # Only one deploy at a time; a newer merge waits its turn
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-1
+  CLUSTER: eks-sample-cluster
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45                           # Backstop; the per-step limits below fire first so rollback and alert still run
+    steps:
+      - uses: actions/checkout@v4                 # Get the merged code
+
+      - uses: actions/setup-java@v4               # Install Java 21 and cache Maven downloads
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: aws-actions/configure-aws-credentials@v4  # Short-lived AWS credentials for this run
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set image tag to the commit ID
+        run: echo "TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"  # e.g. 3b2e6d0
+
+      - name: Build and push image to ECR
+        timeout-minutes: 15
+        run: ./scripts/push-to-ecr.sh "$TAG"
+
+      - name: Point kubectl at the cluster
+        run: aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"
+
+      - name: Deploy
+        id: deploy
+        timeout-minutes: 10
+        run: ./scripts/deploy.sh "$TAG"           # Fails if the rollout isn't ready within 5 min
+
+      - name: Smoke test
+        timeout-minutes: 5
+        run: ./scripts/test-app.sh                # Fails if /hello doesn't answer
+
+      - name: Roll back to the previous version
+        if: failure() && steps.deploy.outcome != 'skipped'  # Only if the deploy step actually ran
+        run: kubectl rollout undo deployment/eks-deploy-sample || true
+
+      - name: Email alert
+        if: failure()
+        env:
+          TOPIC_ARN: ${{ vars.SNS_TOPIC_ARN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          ROLLED_BACK: ${{ steps.deploy.outcome != 'skipped' && 'yes (previous version restored)' || 'no (nothing was deployed)' }}
+          LOGS: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          aws sns publish --topic-arn "$TOPIC_ARN" \
+            --subject "Deploy FAILED: $REPO @ ${GITHUB_SHA::7}" \
+            --message "The CD pipeline failed or timed out.
+
+          Repository:  $REPO
+          Commit:      $GITHUB_SHA
+          Pushed by:   $ACTOR
+          Message:     $COMMIT_MSG
+          Rolled back: $ROLLED_BACK
+          Logs:        $LOGS"
