@@ -62,7 +62,7 @@ A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Ser
 eks_deploy_sample/
 ├── .github/workflows/
 │   ├── ci.yml                    # On pull requests: build, test, build image
-│   └── cd.yml                    # On push to main: push, deploy, smoke test; roll back + email on failure
+│   └── cd.yml                    # On push to main: push, deploy, smoke test; email on success; roll back + email on failure
 ├── Dockerfile
 ├── scripts/
 │   ├── run-local.sh              # Build jar + image and run the container locally
@@ -772,18 +772,19 @@ Once this is set up, nobody runs the scripts by hand. The team workflow becomes:
 ```
 feature branch ──▶ pull request ──▶ CI: build + test + image build ──▶ peer review ──▶ merge to main
                                                                                             │
-   email alert ◀── roll back ◀── (any failure or timeout) ◀── CD: push ─▶ deploy ─▶ smoke test
+   email alert ◀── roll back ◀── (any failure or timeout) ◀── CD: push ─▶ deploy ─▶ smoke test ─▶ success email
 ```
 
 | Workflow | Runs when | What it does |
 |---|---|---|
 | `.github/workflows/ci.yml` | A pull request targets `main` | `mvn verify` (compile + tests) and `docker build`. Nothing is pushed or deployed. |
-| `.github/workflows/cd.yml` | Code lands on `main` (a merged PR) | `push-to-ecr.sh`, `deploy.sh`, `test-app.sh` using the **commit ID** as the image tag (for example `3b2e6d0`). On failure or timeout: `kubectl rollout undo`, then an email via SNS. |
+| `.github/workflows/cd.yml` | Code lands on `main` (a merged PR) | `push-to-ecr.sh`, `deploy.sh`, `test-app.sh` using the **commit ID** as the image tag (for example `3b2e6d0`). On success: a "Deploy succeeded" email via SNS. On failure or timeout: `kubectl rollout undo`, then a "Deploy FAILED" email via SNS. |
 
 - **The cluster must already be running** (Step 5). CD deploys to it but never creates or deletes it.
 - **Image tag = commit ID.** Every image in ECR maps to exactly one commit, so tags never collide between developers.
 - **One deploy at a time.** If two PRs merge close together, the second deploy waits for the first.
 - **Time limits:** build and push 15 min, deploy 10 min, smoke test 5 min. Going over a limit counts as a failure, so it triggers the rollback and the email.
+- **Emails go to the SNS subscribers** (step 4), on success and on failure. The one exception: if the AWS login itself fails, SNS can't be reached, so no SNS email is sent. GitHub's own "workflow failed" email covers that case. It goes to your GitHub account's notification email (see step 9).
 
 ### One-time setup (by hand)
 
@@ -814,6 +815,16 @@ aws iam create-open-id-connect-provider \
 
 **3. Create the IAM role GitHub will use.** Only workflows running on this repo's `main` branch can assume it.
 
+First, ask GitHub exactly how it identifies this repo when logging in (the *subject* prefix). Newer repos use an **immutable** format that includes the owner and repo ID numbers, such as `repo:naveenkrishnan01@1700446/EKS_DEPLOY_DEMO@1396760023`. Older ones use `repo:naveenkrishnan01/EKS_DEPLOY_DEMO`. The trust rule must match it exactly.
+
+```bash
+export SUB_PREFIX=$(gh api "repos/${GH_REPO}/actions/oidc/customization/sub" --jq '.sub_claim_prefix // empty')
+export SUB_PREFIX=${SUB_PREFIX:-repo:${GH_REPO}}
+echo "$SUB_PREFIX"    # e.g. repo:naveenkrishnan01@1700446/EKS_DEPLOY_DEMO@1396760023
+```
+
+Then create the role:
+
 ```bash
 cat > /tmp/gha-trust.json <<EOF
 {
@@ -825,7 +836,7 @@ cat > /tmp/gha-trust.json <<EOF
     "Condition": {
       "StringEquals": {
         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        "token.actions.githubusercontent.com:sub": "repo:${GH_REPO}:ref:refs/heads/main"
+        "token.actions.githubusercontent.com:sub": "${SUB_PREFIX}:ref:refs/heads/main"
       }
     }
   }]
@@ -909,6 +920,10 @@ repo **Settings → Branches → Add branch ruleset** (or *Add classic branch pr
 
 > Working solo? GitHub doesn't let you approve your own PR. Set required approvals to **0** until there's a second reviewer, but keep the status check required.
 
+**9. Where emails go.**
+- **Deploy succeeded / Deploy FAILED** come from SNS and go to the address subscribed in step 4 (`naveenkrishnan99@yahoo.com`).
+- **GitHub's own "workflow failed" email** goes to your GitHub account's notification email (here `naveenkrishnan01@gmail.com`). It's the only alert when the AWS login itself fails, since SNS can't be reached then. Make sure it's on: profile picture → **Settings** → **Notifications** → **System** → **Actions** → tick **Email** and **Only notify for failed workflows**.
+
 ### Try it
 
 ```bash
@@ -933,7 +948,7 @@ aws sns publish --topic-arn "$TOPIC_ARN" --region "$AWS_REGION" \
 
 | Error in the run log | Cause | Fix |
 |---|---|---|
-| `Could not assume role` / `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The `AWS_ROLE_ARN` variable is wrong, or the run wasn't on `main` | Check step 7, and the trust policy in step 3 |
+| `Could not assume role` / `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The trust policy's `sub` doesn't match what GitHub sends (most often the **immutable subject** format with ID numbers), the `AWS_ROLE_ARN` variable is wrong, or the run wasn't on `main` | Redo step 3 with `SUB_PREFIX` from `gh api`, or edit the trust policy in the console (IAM → Roles → role → Trust relationships). Check step 7. |
 | `You must be logged in to the server (Unauthorized)` | The role has no access entry in the cluster, for example after recreating it | Redo step 6 |
 | `AccessDenied ... sns:Publish` | The topic ARN in GitHub doesn't match the one in the permissions | Redo steps 5 and 7 with the same `TOPIC_ARN` |
 | `ResourceNotFoundException ... eks-sample-cluster` | The cluster isn't running | `./scripts/create-cluster.sh`, then step 6 |
