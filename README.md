@@ -920,10 +920,9 @@ repo **Settings → Branches → Add branch ruleset** (or *Add classic branch pr
 
 > Working solo? GitHub doesn't let you approve your own PR. Set required approvals to **0** until there's a second reviewer, but keep the status check required.
 
-**9. Send GitHub's own failure emails to the same address (optional).** GitHub emails workflow failures to your account's notification email, which may not be the SNS address.
-1. Profile picture → **Settings** → **Emails** → **Add email address** → `naveenkrishnan99@yahoo.com` → click the link in GitHub's verification email.
-2. **Settings** → **Notifications** → **Default notifications email** → choose `naveenkrishnan99@yahoo.com` → **Save**.
-3. Same page, **System** → **Actions** → tick **Email** and **Only notify for failed workflows**.
+**9. Where emails go.**
+- **Deploy succeeded / Deploy FAILED** come from SNS and go to the address subscribed in step 4 (`naveenkrishnan99@yahoo.com`).
+- **GitHub's own "workflow failed" email** goes to your GitHub account's notification email (here `naveenkrishnan01@gmail.com`). It's the only alert when the AWS login itself fails, since SNS can't be reached then. Make sure it's on: profile picture → **Settings** → **Notifications** → **System** → **Actions** → tick **Email** and **Only notify for failed workflows**.
 
 ### Try it
 
