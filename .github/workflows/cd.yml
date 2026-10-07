@@ -1,6 +1,6 @@
 # CD: runs on every push (merged PR) to main. Assumes the EKS cluster is already running.
 # Builds and pushes the image tagged with the commit ID, deploys it, and smoke tests it.
-# On any failure or timeout: rolls back the deployment and emails an alert through SNS.
+# Emails through SNS on success; on any failure or timeout, rolls back the deployment and emails an alert.
 name: CD
 
 on:
@@ -55,6 +55,27 @@ jobs:
       - name: Smoke test
         timeout-minutes: 5
         run: ./scripts/test-app.sh                # Fails if /hello doesn't answer
+
+      - name: Email success
+        if: success()
+        continue-on-error: true                   # A failed email must never roll back a good deploy
+        env:
+          TOPIC_ARN: ${{ vars.SNS_TOPIC_ARN }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          LOGS: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          aws sns publish --topic-arn "$TOPIC_ARN" \
+            --subject "Deploy succeeded: $REPO @ $TAG" \
+            --message "The CD pipeline deployed a new version and the smoke test passed.
+
+          Repository:  $REPO
+          Image tag:   $TAG
+          Commit:      $GITHUB_SHA
+          Pushed by:   $ACTOR
+          Message:     $COMMIT_MSG
+          Logs:        $LOGS"
 
       - name: Roll back to the previous version
         if: failure() && steps.deploy.outcome != 'skipped'  # Only if the deploy step actually ran
