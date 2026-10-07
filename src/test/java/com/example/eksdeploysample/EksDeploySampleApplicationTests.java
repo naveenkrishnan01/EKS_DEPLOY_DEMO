@@ -20,7 +20,7 @@ class EksDeploySampleApplicationTests {
     void helloReturnsMessage() {
         ResponseEntity<String> response = rest.getForEntity("/hello", String.class);
         assertThat(response.getStatusCode()).as("/hello should return 200 OK").isEqualTo(HttpStatus.OK);
-        assertThat(response.getBody()).as("/hello should return a message").contains("\"message\"");
+        assertThat(response.getBody()).as("/greeting should return a message").contains("\"message\"");
         System.out.println("PASS: /hello returned " + response.getBody());
     }
 
