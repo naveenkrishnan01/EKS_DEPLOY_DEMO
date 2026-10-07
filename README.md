@@ -37,6 +37,7 @@ A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Ser
 - [Step 8 — Roll out v2](#step-8--roll-out-v2)
 - [Step 9 — Clean up](#step-9--clean-up)
 - [Step 10 — CI/CD with GitHub Actions](#step-10--cicd-with-github-actions)
+- [Step 11 — Demo: CI/CD in action](#step-11--demo-cicd-in-action)
 - [Troubleshooting (issues we actually hit)](#troubleshooting-issues-we-actually-hit)
 - [Next things to do](#next-things-to-do)
 
@@ -952,6 +953,200 @@ aws sns publish --topic-arn "$TOPIC_ARN" --region "$AWS_REGION" \
 | `You must be logged in to the server (Unauthorized)` | The role has no access entry in the cluster, for example after recreating it | Redo step 6 |
 | `AccessDenied ... sns:Publish` | The topic ARN in GitHub doesn't match the one in the permissions | Redo steps 5 and 7 with the same `TOPIC_ARN` |
 | `ResourceNotFoundException ... eks-sample-cluster` | The cluster isn't running | `./scripts/create-cluster.sh`, then step 6 |
+
+---
+
+## Step 11 — Demo: CI/CD in action
+
+Three short scenarios that show the pipeline catching a bad change, then shipping good ones to the cluster.
+
+**Before the demo:**
+- The cluster is running (`./scripts/create-cluster.sh`) and Step 10's step 6 has been done on it.
+- Your local `main` is up to date: `git switch main && git pull`.
+- Open two terminals in the project folder. **Terminal 2** is for watching the live app.
+
+In **Terminal 2**, start watching the app before you begin (Ctrl+C to stop):
+
+```bash
+export URL=$(kubectl get svc eks-deploy-sample-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo $URL    # must NOT be blank
+while true; do curl -s http://$URL/hello; echo; sleep 2; done
+```
+
+It shows what production serves right now, for example `{"message":"Hello from EKS updating this!!","version":"v1","pod":"..."}`.
+
+---
+
+### Use case 1 — A code change without a matching test update: CI fails and the merge is blocked
+
+**Goal:** show that broken code can't reach `main`.
+
+**1. Create the branch:**
+
+```bash
+git switch main && git pull
+git switch -c feature-3
+```
+
+**2. Change the code but not the test.** In `src/main/java/com/example/eksdeploysample/EksDeploySampleApplication.java`, rename the JSON key `"message"` to `"greeting"`:
+
+```java
+// before
+"message", "Hello from EKS updating this!!",
+// after
+"greeting", "Hello from EKS updating this!!",
+```
+
+Leave `EksDeploySampleApplicationTests.java` alone. It still expects a `"message"` key.
+
+**3. (Optional) See it fail locally first:**
+
+```bash
+mvn -q verify     # fails: [/hello should return a message] ... to contain "message"
+```
+
+**4. Push and open a pull request:**
+
+```bash
+git commit -am "Rename message to greeting (test not updated)"
+git push -u origin feature-3
+gh pr create --fill
+```
+
+**5. Show the result:**
+
+```bash
+gh pr checks --watch        # build: fail
+```
+
+On GitHub, the PR's **Checks** show **CI / build ❌**, and the **Merge** button is disabled ("Required status check build has failed"). Open the failed check → **Build and test** to show the reason:
+
+```
+[/hello should return a message]
+Expecting actual: "{"greeting":"Hello from EKS ...", ...}" to contain: ""message""
+```
+
+Try to merge from the terminal. It's refused:
+
+```bash
+gh pr merge --squash        # refused: the required check has failed
+```
+
+**What this proves:** CI caught the mismatch. Nothing was pushed to ECR or deployed, and **Terminal 2 still shows `"message"`**.
+
+---
+
+### Use case 2 — Fix the test: CI passes, CD deploys, and `curl` shows the change
+
+**Goal:** show the same PR going green and reaching production automatically.
+
+**1. Update the test to match the code.** On the same `feature-3` branch, in `src/test/java/com/example/eksdeploysample/EksDeploySampleApplicationTests.java`:
+
+```java
+// before
+assertThat(response.getBody()).as("/hello should return a message").contains("\"message\"");
+// after
+assertThat(response.getBody()).as("/hello should return a greeting").contains("\"greeting\"");
+```
+
+```bash
+mvn -q verify               # optional: passes locally now
+git commit -am "Update test for greeting key"
+git push
+```
+
+**2. CI runs again on the PR:**
+
+```bash
+gh pr checks --watch        # build: pass
+```
+
+The **Merge** button is enabled now.
+
+**3. Merge. This starts CD:**
+
+```bash
+gh pr merge --squash --delete-branch
+gh run watch                # pick the "CD" run: push → deploy → smoke test → email
+```
+
+**4. Show the change in production:**
+- **Terminal 2** flips from `{"message": ...}` to `{"greeting": ...}`. During the rolling update you may see both for a few seconds, and never an error.
+- Run the smoke test yourself:
+  ```bash
+  ./scripts/test-app.sh       # {"greeting":"Hello from EKS updating this!!", ...}
+  ```
+- **Email:** "Deploy succeeded" arrives at naveenkrishnan99@yahoo.com with the commit ID.
+- **ECR:** a new image tagged with the merge commit ID:
+  ```bash
+  git switch main && git pull
+  git log --oneline -1        # e.g. 4f2a9c1
+  kubectl get deploy eks-deploy-sample -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+  # ...eks-deploy-sample:4f2a9c1  ← same ID
+  ```
+
+---
+
+### Use case 3 — Another change on a new branch: CI/CD succeeds and the new pods serve it
+
+**Goal:** show the everyday flow end to end, with proof that the **new pods** have the latest code.
+
+**1. Note the current pods** (old version):
+
+```bash
+kubectl get pods -l app=eks-deploy-sample      # note the pod names and AGE
+```
+
+**2. Create the branch and change the code:**
+
+```bash
+git switch main && git pull
+git switch -c feature-4
+```
+
+In `EksDeploySampleApplication.java`, change the text and the version:
+
+```java
+"greeting", "Hello from EKS - deployed by CI/CD!",
+"version", "v4",
+```
+
+No test change is needed, because the test checks that the `"greeting"` key exists, not its wording.
+
+**3. Push, open the PR, and wait for green CI:**
+
+```bash
+git commit -am "New greeting, version v4"
+git push -u origin feature-4
+gh pr create --fill
+gh pr checks --watch        # build: pass
+```
+
+**4. Merge and watch CD:**
+
+```bash
+gh pr merge --squash --delete-branch
+gh run watch
+```
+
+**5. Show the latest change is live:**
+- **Terminal 2** switches to `{"greeting":"Hello from EKS - deployed by CI/CD!","version":"v4", ...}` with no failed requests.
+- New pods replaced the old ones, with different names and a young AGE:
+  ```bash
+  kubectl get pods -l app=eks-deploy-sample
+  ```
+- The `pod` value in each response matches one of those **new** pod names:
+  ```bash
+  ./scripts/test-app.sh
+  ```
+- The running image tag equals the latest commit on `main`:
+  ```bash
+  git switch main && git pull && git log --oneline -1
+  kubectl get deploy eks-deploy-sample -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+  ```
+- **Email:** a second "Deploy succeeded" with the new commit ID.
+
+**After the demo:** stop Terminal 2 (Ctrl+C), then `./scripts/clean-up.sh` to delete the cluster so it stops costing money.
 
 ---
 
