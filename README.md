@@ -36,6 +36,7 @@ A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Ser
 - [Step 7 — Test v1](#step-7--test-v1)
 - [Step 8 — Roll out v2](#step-8--roll-out-v2)
 - [Step 9 — Clean up](#step-9--clean-up)
+- [Step 10 — CI/CD with GitHub Actions](#step-10--cicd-with-github-actions)
 - [Troubleshooting (issues we actually hit)](#troubleshooting-issues-we-actually-hit)
 - [Next things to do](#next-things-to-do)
 
@@ -59,6 +60,9 @@ A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Ser
 
 ```
 eks_deploy_sample/
+├── .github/workflows/
+│   ├── ci.yml                    # On pull requests: build, test, build image
+│   └── cd.yml                    # On push to main: push, deploy, smoke test; roll back + email on failure
 ├── Dockerfile
 ├── scripts/
 │   ├── run-local.sh              # Build jar + image and run the container locally
@@ -72,11 +76,14 @@ eks_deploy_sample/
 ├── pom.xml
 ├── k8s/
 │   └── app.yaml                  # Deployment + LoadBalancer Service
-└── src/main/
-    ├── java/com/example/eksdeploysample/
-    │   └── EksDeploySampleApplication.java # /hello endpoint
-    └── resources/
-        └── application.yml
+└── src/
+    ├── main/
+    │   ├── java/com/example/eksdeploysample/
+    │   │   └── EksDeploySampleApplication.java      # /hello endpoint
+    │   └── resources/
+    │       └── application.yml
+    └── test/java/com/example/eksdeploysample/
+        └── EksDeploySampleApplicationTests.java     # /hello and readiness checks (run by CI)
 ```
 
 ---
@@ -583,7 +590,7 @@ set -euo pipefail                        # Exit on error, on unset variables, an
 URL=$(kubectl get svc eks-deploy-sample-svc \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')  # Load balancer hostname of the Service
 echo $URL                                # Show the address
-curl http://$URL/hello                   # Call the /hello endpoint
+curl -sSf --retry 10 --retry-delay 15 --retry-all-errors http://$URL/hello  # Call /hello; retry for ~2.5 min, and fail if it never answers
 echo                                     # Newline after the JSON response
 ```
 
@@ -612,7 +619,7 @@ Expected response:
 {"message":"Hello from EKS","version":"v1","pod":"eks-deploy-sample-cc445fbd6-4pzg7"}
 ```
 
-- The first run can fail for 2–3 minutes while the load balancer's DNS name starts resolving. Wait and run it again.
+- Right after the first deploy, the load balancer's DNS name can take 2–3 minutes to start working. The script retries for about 2.5 minutes and exits with an error if `/hello` never answers, which is what lets the CI/CD pipeline (Step 10) detect a broken deploy.
 - Run it several times: the `pod` value alternates between the two replicas, which shows the load balancer spreading traffic.
 
 **Where to see it in the AWS console** (region **us-west-1**):
@@ -758,6 +765,181 @@ Optionally, reclaim disk space from old images first with `docker system prune -
 
 ---
 
+## Step 10 — CI/CD with GitHub Actions
+
+Once this is set up, nobody runs the scripts by hand. The team workflow becomes:
+
+```
+feature branch ──▶ pull request ──▶ CI: build + test + image build ──▶ peer review ──▶ merge to main
+                                                                                            │
+   email alert ◀── roll back ◀── (any failure or timeout) ◀── CD: push ─▶ deploy ─▶ smoke test
+```
+
+| Workflow | Runs when | What it does |
+|---|---|---|
+| `.github/workflows/ci.yml` | A pull request targets `main` | `mvn verify` (compile + tests) and `docker build`. Nothing is pushed or deployed. |
+| `.github/workflows/cd.yml` | Code lands on `main` (a merged PR) | `push-to-ecr.sh`, `deploy.sh`, `test-app.sh` using the **commit ID** as the image tag (for example `3b2e6d0`). On failure or timeout: `kubectl rollout undo`, then an email via SNS. |
+
+- **The cluster must already be running** (Step 5). CD deploys to it but never creates or deletes it.
+- **Image tag = commit ID.** Every image in ECR maps to exactly one commit, so tags never collide between developers.
+- **One deploy at a time.** If two PRs merge close together, the second deploy waits for the first.
+- **Time limits:** build and push 15 min, deploy 10 min, smoke test 5 min. Going over a limit counts as a failure, so it triggers the rollback and the email.
+
+### One-time setup (by hand)
+
+GitHub logs in to AWS with **OIDC**: each run gets short-lived credentials for one IAM role, so no AWS keys are stored in GitHub. Run these from the project folder in one terminal, in order.
+
+**1. Set variables for the setup commands.**
+
+```bash
+export AWS_REGION=us-west-1
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export GH_REPO=naveenkrishnan01/EKS_DEPLOY_DEMO
+export CLUSTER=eks-sample-cluster
+export ROLE_NAME=github-actions-eks-deploy
+export ALERT_EMAIL=naveenkrishnan99@yahoo.com
+echo "$ACCOUNT_ID"    # must NOT be blank
+```
+
+**2. Let AWS trust GitHub's login service.** This is done once per AWS account.
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com
+```
+
+> If it says the provider already exists, that's fine; move on. If it asks for a thumbprint, add `--thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1`.
+> Console alternative: IAM → Identity providers → Add provider → OpenID Connect, URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
+
+**3. Create the IAM role GitHub will use.** Only workflows running on this repo's `main` branch can assume it.
+
+```bash
+cat > /tmp/gha-trust.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:${GH_REPO}:ref:refs/heads/main"
+      }
+    }
+  }]
+}
+EOF
+
+aws iam create-role --role-name "$ROLE_NAME" \
+  --assume-role-policy-document file:///tmp/gha-trust.json \
+  --query Role.Arn --output text          # prints the role ARN
+```
+
+**4. Create the SNS topic and subscribe your email.**
+
+```bash
+export TOPIC_ARN=$(aws sns create-topic --name eks-deploy-alerts --region "$AWS_REGION" --query TopicArn --output text)
+echo "$TOPIC_ARN"     # must NOT be blank
+
+aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol email \
+  --notification-endpoint "$ALERT_EMAIL" --region "$AWS_REGION"
+```
+
+**Open the "AWS Notification - Subscription Confirmation" email and click _Confirm subscription_.** No alerts are delivered until you do. Check the spam folder if it isn't in your inbox.
+
+**5. Give the role only the permissions the pipeline needs.** That means pushing to the one ECR repository, finding the cluster, and publishing to the one SNS topic.
+
+```bash
+cat > /tmp/gha-permissions.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
+    { "Effect": "Allow",
+      "Action": [
+        "ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:ListImages", "ecr:DescribeImages",
+        "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": "arn:aws:ecr:${AWS_REGION}:${ACCOUNT_ID}:repository/eks-deploy-sample" },
+    { "Effect": "Allow", "Action": "eks:DescribeCluster",
+      "Resource": "arn:aws:eks:${AWS_REGION}:${ACCOUNT_ID}:cluster/${CLUSTER}" },
+    { "Effect": "Allow", "Action": "sns:Publish", "Resource": "${TOPIC_ARN}" }
+  ]
+}
+EOF
+
+aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name eks-deploy-pipeline \
+  --policy-document file:///tmp/gha-permissions.json
+```
+
+**6. Allow the role to deploy inside the cluster.** It can edit resources in the `default` namespace only.
+
+```bash
+aws eks create-access-entry --cluster-name "$CLUSTER" --region "$AWS_REGION" \
+  --principal-arn "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+
+aws eks associate-access-policy --cluster-name "$CLUSTER" --region "$AWS_REGION" \
+  --principal-arn "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy \
+  --access-scope type=namespace,namespaces=default
+```
+
+> **Repeat this step whenever you recreate the cluster.** Access entries belong to the cluster, so `clean-up.sh` removes them along with it. Steps 2–5 and 7–8 don't need repeating.
+> If `create-access-entry` says the cluster's authentication mode doesn't support it, enable access entries first, then rerun step 6:
+> `aws eks update-cluster-config --name "$CLUSTER" --region "$AWS_REGION" --access-config authenticationMode=API_AND_CONFIG_MAP`
+
+**7. Tell GitHub the role and topic.** These are repository *variables*, not secrets: ARNs aren't passwords.
+
+```bash
+gh variable set AWS_ROLE_ARN  --repo "$GH_REPO" --body "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+gh variable set SNS_TOPIC_ARN --repo "$GH_REPO" --body "$TOPIC_ARN"
+gh variable list --repo "$GH_REPO"       # both should be listed
+```
+
+(Or in the browser: repo **Settings → Secrets and variables → Actions → Variables → New repository variable**.)
+
+**8. Protect `main` so code only gets there through a reviewed PR with passing CI.** In the browser:
+repo **Settings → Branches → Add branch ruleset** (or *Add classic branch protection rule*) for `main`:
+- **Require a pull request before merging**, with required approvals set to **1**
+- **Require status checks to pass**, and add the check **`build`**. It only appears in the list after CI has run once, so open one PR first.
+- **Block force pushes**
+
+> Working solo? GitHub doesn't let you approve your own PR. Set required approvals to **0** until there's a second reviewer, but keep the status check required.
+
+### Try it
+
+```bash
+git switch -c feature/new-message
+# edit the "message" text in EksDeploySampleApplication.java
+git commit -am "Change hello message"
+git push -u origin feature/new-message
+gh pr create --fill                       # CI runs on the PR; watch it in the PR's Checks tab
+gh pr merge --squash --delete-branch      # after review + green CI; CD starts on main
+gh run watch                              # follow the CD run live
+./scripts/test-app.sh                     # the new message, served by the image tagged with the commit ID
+```
+
+**Test the email alert without breaking anything:**
+
+```bash
+aws sns publish --topic-arn "$TOPIC_ARN" --region "$AWS_REGION" \
+  --subject "Test alert" --message "If you can read this, deploy alerts work."
+```
+
+### If CD fails
+
+| Error in the run log | Cause | Fix |
+|---|---|---|
+| `Could not assume role` / `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The `AWS_ROLE_ARN` variable is wrong, or the run wasn't on `main` | Check step 7, and the trust policy in step 3 |
+| `You must be logged in to the server (Unauthorized)` | The role has no access entry in the cluster, for example after recreating it | Redo step 6 |
+| `AccessDenied ... sns:Publish` | The topic ARN in GitHub doesn't match the one in the permissions | Redo steps 5 and 7 with the same `TOPIC_ARN` |
+| `ResourceNotFoundException ... eks-sample-cluster` | The cluster isn't running | `./scripts/create-cluster.sh`, then step 6 |
+
+---
+
 ## Troubleshooting (issues we actually hit)
 
 ### `SignatureDoesNotMatch` on `aws sts get-caller-identity`
@@ -835,6 +1017,6 @@ kubectl get events --sort-by=.lastTimestamp     # cluster-wide recent events
 ## Next things to do
 
 - **AWS Load Balancer Controller + Ingress** — an ALB with path-based routing and HTTPS
-- **CI/CD** — a GitHub Actions workflow that builds, pushes and deploys on every commit
+- **Staging before production** — deploy to a staging namespace first, then promote the same image to prod with an approval
 - **Pod Identity / IRSA** — give pods scoped IAM permissions to call S3, DynamoDB, etc.
 - **Horizontal Pod Autoscaler** — scale replicas automatically on CPU load

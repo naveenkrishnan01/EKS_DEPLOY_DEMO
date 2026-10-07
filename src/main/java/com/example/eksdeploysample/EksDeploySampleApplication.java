@@ -21,7 +21,7 @@ public class EksDeploySampleApplication {
     public Map<String, String> hello() throws Exception {
         return Map.of(
                 "message", "Hello from EKS updating this!!",
-                "version", "v2",
+                "version", "v1",
                 "pod", InetAddress.getLocalHost().getHostName());
     }
 }
