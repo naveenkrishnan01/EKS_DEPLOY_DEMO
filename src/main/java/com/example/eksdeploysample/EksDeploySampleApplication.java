@@ -20,7 +20,7 @@ public class EksDeploySampleApplication {
     @GetMapping("/hello")
     public Map<String, String> hello() throws Exception {
         return Map.of(
-                "message", "Hello from EKS created feature-3 branch!!",
+                "greeting", "Hello from EKS created feature-3 branch!!",
                 "version", "v1",
                 "pod", InetAddress.getLocalHost().getHostName());
     }
