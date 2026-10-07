@@ -62,7 +62,7 @@ A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Ser
 ```
 eks_deploy_sample/
 ├── .github/workflows/
-│   ├── ci.yml                    # On pull requests: build, test, build image
+│   ├── ci.yml                    # On pull requests: build, test, build image; email on failure
 │   └── cd.yml                    # On push to main: push, deploy, smoke test; email on success; roll back + email on failure
 ├── Dockerfile
 ├── scripts/
@@ -778,7 +778,7 @@ feature branch ──▶ pull request ──▶ CI: build + test + image build �
 
 | Workflow | Runs when | What it does |
 |---|---|---|
-| `.github/workflows/ci.yml` | A pull request targets `main` | `mvn verify` (compile + tests) and `docker build`. Nothing is pushed or deployed. |
+| `.github/workflows/ci.yml` | A pull request targets `main` | `mvn verify` (compile + tests) and `docker build`. Nothing is pushed or deployed. On failure: a "CI FAILED" email via SNS. |
 | `.github/workflows/cd.yml` | Code lands on `main` (a merged PR) | `push-to-ecr.sh`, `deploy.sh`, `test-app.sh` using the **commit ID** as the image tag (for example `3b2e6d0`). On success: a "Deploy succeeded" email via SNS. On failure or timeout: `kubectl rollout undo`, then a "Deploy FAILED" email via SNS. |
 
 - **The cluster must already be running** (Step 5). CD deploys to it but never creates or deletes it.
@@ -921,9 +921,59 @@ repo **Settings → Branches → Add branch ruleset** (or *Add classic branch pr
 
 > Working solo? GitHub doesn't let you approve your own PR. Set required approvals to **0** until there's a second reviewer, but keep the status check required.
 
-**9. Where emails go.**
-- **Deploy succeeded / Deploy FAILED** come from SNS and go to the address subscribed in step 4 (`naveenkrishnan99@yahoo.com`).
-- **GitHub's own "workflow failed" email** goes to your GitHub account's notification email (here `naveenkrishnan01@gmail.com`). It's the only alert when the AWS login itself fails, since SNS can't be reached then. Make sure it's on: profile picture → **Settings** → **Notifications** → **System** → **Actions** → tick **Email** and **Only notify for failed workflows**.
+**9. Email alerts for failed CI builds.** CI runs pull-request code that hasn't been reviewed yet, so it gets its **own role that can only publish to the alerts topic**. It has no ECR or cluster access.
+
+```bash
+export CI_ROLE_NAME=github-actions-ci-alerts
+export TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${ACCOUNT_ID}:eks-deploy-alerts
+export SUB_PREFIX=$(gh api "repos/${GH_REPO}/actions/oidc/customization/sub" --jq '.sub_claim_prefix // empty')
+export SUB_PREFIX=${SUB_PREFIX:-repo:${GH_REPO}}
+
+cat > /tmp/gha-ci-trust.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "${SUB_PREFIX}:pull_request"
+      }
+    }
+  }]
+}
+EOF
+
+cat > /tmp/gha-ci-permissions.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{ "Effect": "Allow", "Action": "sns:Publish", "Resource": "${TOPIC_ARN}" }]
+}
+EOF
+
+aws iam create-role --role-name "$CI_ROLE_NAME" \
+  --assume-role-policy-document file:///tmp/gha-ci-trust.json --query Role.Arn --output text
+aws iam put-role-policy --role-name "$CI_ROLE_NAME" --policy-name ci-alerts-only \
+  --policy-document file:///tmp/gha-ci-permissions.json
+```
+
+Then add a third GitHub variable (Settings → Secrets and variables → Actions → Variables):
+- `CI_ALERT_ROLE_ARN` = `arn:aws:iam::<account-id>:role/github-actions-ci-alerts`, the ARN printed by `create-role`.
+
+> The trust rule ends in `:pull_request` instead of `:ref:refs/heads/main`, so this role is only usable by pull-request runs, and the deploy role is still only usable from `main`. Pull requests from forks never get AWS access: GitHub doesn't give them an OIDC token.
+
+**10. Where emails go.**
+
+| Email | Sent by | Goes to |
+|---|---|---|
+| **CI FAILED** (a PR's build or tests fail) | SNS, from CI | the SNS subscriber from step 4 (`naveenkrishnan99@yahoo.com`) |
+| **Deploy succeeded** / **Deploy FAILED** | SNS, from CD | the SNS subscriber from step 4 |
+| GitHub's own "workflow failed" | GitHub | your GitHub account's notification email (here `naveenkrishnan01@gmail.com`) |
+
+- SNS emails come from **no-reply@sns.amazonaws.com**. If they don't show up, check Spam/Bulk, click **Not spam**, and add that address to your contacts.
+- GitHub's own email is the backup for the one case SNS can't cover: when the AWS login itself fails. To stop it, uncheck **Email** under **Settings → Notifications → System → Actions**, but then that case has no alert.
 
 ### Try it
 
@@ -953,6 +1003,8 @@ aws sns publish --topic-arn "$TOPIC_ARN" --region "$AWS_REGION" \
 | `You must be logged in to the server (Unauthorized)` | The role has no access entry in the cluster, for example after recreating it | Redo step 6 |
 | `AccessDenied ... sns:Publish` | The topic ARN in GitHub doesn't match the one in the permissions | Redo steps 5 and 7 with the same `TOPIC_ARN` |
 | `ResourceNotFoundException ... eks-sample-cluster` | The cluster isn't running | `./scripts/create-cluster.sh`, then step 6 |
+| CI's **Log in to AWS for the alert** fails | The `CI_ALERT_ROLE_ARN` variable is missing or wrong, or the CI role's trust rule doesn't end in `:pull_request` | Redo step 9 |
+| No SNS emails arrive, but the run log shows a `MessageId` | The email was delivered but filtered | Check Spam/Bulk for no-reply@sns.amazonaws.com |
 
 ---
 

@@ -1,10 +1,15 @@
 # CI: runs on every pull request to main. Builds, tests, and builds the Docker image.
 # Nothing is pushed or deployed. Make this check required before merging (branch protection).
+# On failure, emails an alert through SNS using a role that can only publish to the alerts topic.
 name: CI
 
 on:
   pull_request:
     branches: [main]
+
+permissions:
+  id-token: write                                 # Needed to log in to AWS with OIDC for the alert
+  contents: read
 
 jobs:
   build:
@@ -24,3 +29,33 @@ jobs:
 
       - name: Build Docker image
         run: docker build --platform linux/amd64 -t eks-deploy-sample:pr .  # Make sure the Dockerfile still builds
+
+      - name: Log in to AWS for the alert
+        if: failure()
+        uses: aws-actions/configure-aws-credentials@v4  # Alert-only role: can publish to SNS, nothing else
+        with:
+          role-to-assume: ${{ vars.CI_ALERT_ROLE_ARN }}
+          aws-region: us-west-1
+
+      - name: Email alert
+        if: failure()
+        env:
+          TOPIC_ARN: ${{ vars.SNS_TOPIC_ARN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BRANCH: ${{ github.head_ref }}
+          ACTOR: ${{ github.actor }}
+          COMMIT: ${{ github.event.pull_request.head.sha }}
+          LOGS: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          aws sns publish --topic-arn "$TOPIC_ARN" --region us-west-1 \
+            --subject "CI FAILED: $REPO PR #$PR_NUMBER ($BRANCH)" \
+            --message "The CI build failed for a pull request. It can't be merged until this is fixed.
+
+          Repository:  $REPO
+          Pull request: #$PR_NUMBER  $PR_TITLE
+          Branch:      $BRANCH
+          Commit:      $COMMIT
+          Pushed by:   $ACTOR
+          Logs:        $LOGS"
