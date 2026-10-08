@@ -1,797 +1,457 @@
 # eks_deploy_sample — Spring Boot on Amazon EKS
 
-A minimal Spring Boot service deployed to **Amazon EKS** (Elastic Kubernetes Service), end to end:
+A small web app that answers at `/hello`, deployed to **Amazon EKS** (Kubernetes on AWS) in two ways:
 
-1. Build a Spring Boot app with a `/Hello from EKS -` endpoint and health probes
-2. Package it as a Docker image
-3. Push the image to **Amazon ECR** (Elastic Container Registry)
-4. Create an EKS cluster with `eksctl`
-5. Deploy the app behind an AWS load balancer and test it
-6. Ship a **v2** with a zero-downtime rolling update, and roll back if needed
-7. Tear everything down
+| | **Part 1 — Deploy by hand** | **Part 2 — CI/CD pipeline** |
+|---|---|---|
+| **Who runs it** | You, one script per step | GitHub, automatically |
+| **When** | Whenever you run the scripts | Every time a pull request is merged into `main` |
+| **Good for** | Learning each step, first-time setup, experiments | Day-to-day team work: every merged change reaches production on its own, with tests, rollback, and email alerts |
 
-```
- Mac (build)              AWS (us-west-1)
- ┌──────────────┐  push   ┌───────────────────┐  pull   ┌──────────────────── EKS cluster ─────────────────────┐
- │ mvn + docker │ ──────▶ │        ECR        │ ──────▶ │  Deployment: eks-deploy-sample (2 pods)              │
- └──────────────┘         │ eks-deploy-sample │         │            ▲                                         │
-                          └───────────────────┘         │  Service: eks-deploy-sample-svc (LoadBalancer :80)   │
-                                                        └────────────┼─────────────────────────────────────────┘
-                                                     curl http://<elb-hostname>/hello
-```
+Start with **Part 1**: it creates the AWS pieces that Part 2 builds on.
 
 ---
 
 ## Contents
 
-- [Prerequisites](#prerequisites)
-- [Project structure](#project-structure)
-- [Quick start (scripts)](#quick-start-scripts)
-- [Step 1 — AWS credentials (IAM user, not root)](#step-1--aws-credentials-iam-user-not-root)
-- [Step 2 — The Spring Boot app](#step-2--the-spring-boot-app)
-- [Step 3 — Containerize with Docker](#step-3--containerize-with-docker)
-- [Step 4 — Push the image to ECR](#step-4--push-the-image-to-ecr)
-- [Step 5 — Create the EKS cluster](#step-5--create-the-eks-cluster)
-- [Step 6 — Deploy to Kubernetes](#step-6--deploy-to-kubernetes)
-- [Step 7 — Test v1](#step-7--test-v1)
-- [Step 8 — Roll out v2](#step-8--roll-out-v2)
-- [Step 9 — Clean up](#step-9--clean-up)
-- [Step 10 — CI/CD with GitHub Actions](#step-10--cicd-with-github-actions)
-- [Step 11 — Demo: CI/CD in action](#step-11--demo-cicd-in-action)
-- [Troubleshooting (issues we actually hit)](#troubleshooting-issues-we-actually-hit)
+- [Words used in this guide](#words-used-in-this-guide)
+- [How it fits together](#how-it-fits-together)
+- [What's in this project](#whats-in-this-project)
+- **[Part 1 — Deploy by hand: from your Mac to EKS](#part-1--deploy-by-hand-from-your-mac-to-eks)**
+  - [1.1 Install the tools](#11-install-the-tools)
+  - [1.2 Connect your Mac to AWS](#12-connect-your-mac-to-aws)
+  - [1.3 Run the app on your Mac](#13-run-the-app-on-your-mac)
+  - [1.4 Upload the app to AWS (ECR)](#14-upload-the-app-to-aws-ecr)
+  - [1.5 Create the Kubernetes cluster](#15-create-the-kubernetes-cluster)
+  - [1.6 Deploy the app to the cluster](#16-deploy-the-app-to-the-cluster)
+  - [1.7 Test it](#17-test-it)
+  - [1.8 Release a new version](#18-release-a-new-version)
+  - [1.9 Clean up (stop paying)](#19-clean-up-stop-paying)
+  - [Part 1 troubleshooting](#part-1-troubleshooting)
+- **[Part 2 — CI/CD pipeline: automatic test and deploy](#part-2--cicd-pipeline-automatic-test-and-deploy)**
+  - [2.1 How the pipeline works](#21-how-the-pipeline-works)
+  - [2.2 One-time setup](#22-one-time-setup)
+  - [2.3 Everyday use: making a change](#23-everyday-use-making-a-change)
+  - [2.4 Email alerts](#24-email-alerts)
+  - [2.5 Demo: three scenarios](#25-demo-three-scenarios)
+  - [Part 2 troubleshooting](#part-2-troubleshooting)
 - [Next things to do](#next-things-to-do)
 
 ---
 
-## Prerequisites
+## Words used in this guide
 
-| Tool | Install (macOS) | Check |
-|---|---|---|
-| Java 21 + Maven | `brew install openjdk@21 maven` | `java -version && mvn -v` |
-| Docker Desktop | [docker.com](https://www.docker.com/products/docker-desktop/) | `docker info` |
-| AWS CLI v2 | `brew install awscli` | `aws --version` |
-| eksctl | `brew tap eksctl-io/eksctl && brew install eksctl-io/eksctl/eksctl` | `eksctl version` |
-| kubectl | `brew install kubectl` | `kubectl version --client` |
-
-> Use a **release** build of eksctl (plain version number), not a `-dev` build.
+| Word | Plain meaning |
+|---|---|
+| **Docker image** | The app packed into one box with everything it needs to run. Build it once, run it anywhere. |
+| **ECR** (Elastic Container Registry) | AWS's storage for Docker images. Like a shelf where the boxes wait to be used. |
+| **EKS** (Elastic Kubernetes Service) | AWS's managed **Kubernetes**: a system that runs your app on servers, keeps it running, and replaces copies that crash. |
+| **Cluster** | The group of servers Kubernetes manages for you. Here: 2 servers (*nodes*). |
+| **Pod** | One running copy of the app. This project runs 2 so one can fail without downtime. |
+| **Load balancer** | The public front door. It gets an internet address and spreads visitors across the pods. |
+| **Tag** | A label on an image, like `v1` or a commit ID, so you can tell versions apart. |
+| **Branch / pull request (PR)** | A branch is a private copy of the code to work on. A PR asks to merge it into `main` and lets others review it. |
+| **CI** (Continuous Integration) | Automatic checks on every PR: does it build, do the tests pass? |
+| **CD** (Continuous Deployment) | Automatically shipping each merged change to production. |
+| **SNS** | AWS's notification service. Here it sends the alert emails. |
 
 ---
 
-## Project structure
+## How it fits together
+
+```
+ Your Mac (build)          AWS (us-west-1)
+ ┌──────────────┐  push   ┌───────────────────┐  pull   ┌──────────────────── EKS cluster ─────────────────────┐
+ │ mvn + docker │ ──────▶ │        ECR        │ ──────▶ │  Deployment: eks-deploy-sample (2 pods)              │
+ └──────────────┘         │ eks-deploy-sample │         │            ▲                                         │
+  (or GitHub, in Part 2)  └───────────────────┘         │  Service: eks-deploy-sample-svc (LoadBalancer :80)   │
+                                                        └────────────┼─────────────────────────────────────────┘
+                                                     curl http://<load-balancer-address>/hello
+```
+
+In words: the app is **packaged** into a Docker image, **uploaded** to ECR, and **run** by the EKS cluster, which puts a public load balancer in front of it.
+
+---
+
+## What's in this project
 
 ```
 eks_deploy_sample/
-├── .github/workflows/
-│   ├── ci.yml                    # On pull requests: build, test, build image; email on failure
-│   └── cd.yml                    # On push to main: push, deploy, smoke test; email on success; roll back + email on failure
-├── Dockerfile
-├── scripts/
-│   ├── run-local.sh              # Build jar + image and run the container locally
-│   ├── env.sh                    # Shared variables for Steps 4–9 (source ./scripts/env.sh)
-│   ├── push-to-ecr.sh            # Build a linux/amd64 image and push it to ECR
-│   ├── create-cluster.sh         # Create the EKS cluster and point kubectl at it
-│   ├── deploy.sh                 # Apply k8s/app.yaml with the ECR image filled in
-│   ├── test-app.sh               # Get the load balancer address and call /hello
-│   ├── clean-up.sh               # Delete the app and the cluster
-│   └── shut-down-docker.sh       # Stop containers and quit Docker Desktop
-├── pom.xml
-├── k8s/
-│   └── app.yaml                  # Deployment + LoadBalancer Service
-└── src/
-    ├── main/
-    │   ├── java/com/example/eksdeploysample/
-    │   │   └── EksDeploySampleApplication.java      # /hello endpoint
-    │   └── resources/
-    │       └── application.yml
-    └── test/java/com/example/eksdeploysample/
-        └── EksDeploySampleApplicationTests.java     # /hello and readiness checks (run by CI)
+├── src/main/java/.../EksDeploySampleApplication.java   # The app: /hello returns a greeting, a version, and which pod answered
+├── src/main/resources/application.yml                 # App settings (port 8080, health checks for Kubernetes)
+├── src/test/java/.../EksDeploySampleApplicationTests.java  # Automatic tests (run by CI)
+├── pom.xml                                            # Java build settings (Spring Boot 3.5, Java 21)
+├── Dockerfile                                         # How to package the app into a Docker image
+├── k8s/app.yaml                                       # Instructions for Kubernetes: run 2 pods + a load balancer
+├── scripts/                                           # One script per step of Part 1 (every line is commented)
+│   ├── run-local.sh          # 1.3  Build and run the app in Docker on your Mac
+│   ├── env.sh                # 1.4  Shared settings for your terminal (use with: source)
+│   ├── push-to-ecr.sh        # 1.4  Build the image and upload it to ECR
+│   ├── create-cluster.sh     # 1.5  Create the EKS cluster
+│   ├── deploy.sh             # 1.6  Deploy an image version to the cluster
+│   ├── test-app.sh           # 1.7  Call the live app and fail if it doesn't answer
+│   ├── clean-up.sh           # 1.9  Delete the app and the cluster
+│   └── shut-down-docker.sh   # 1.9  Stop containers and quit Docker Desktop
+└── .github/workflows/                                 # Part 2: the pipeline
+    ├── ci.yml                # On every pull request: build, test, build image; email if it fails
+    └── cd.yml                # On every merge to main: upload, deploy, test; email on success; roll back + email on failure
 ```
 
 ---
 
-## Quick start (scripts)
+# Part 1 — Deploy by hand: from your Mac to EKS
 
-After Step 1 (AWS credentials) and with Docker Desktop running, the whole flow is one script per step. Run everything from the project folder:
+You run one script per step, in order. Each step says **what it does**, **what to run**, and **what you should see**.
+
+**Quick version** (after 1.1 and 1.2 are done, Docker Desktop is running, and you're in the project folder):
 
 ```bash
-chmod +x scripts/*.sh                  # first time only
+chmod +x scripts/*.sh                  # first time only: allow the scripts to run
 
-./scripts/run-local.sh                 # Step 3: build and run the container locally (Ctrl+C to stop)
-source ./scripts/env.sh                # Step 4: load shared variables into this terminal
-./scripts/push-to-ecr.sh v1            # Step 4: build and push the v1 image to ECR
-./scripts/create-cluster.sh            # Step 5: create the EKS cluster (~15–20 min, starts billing)
-./scripts/deploy.sh v1                 # Step 6: deploy v1 to the cluster
-./scripts/test-app.sh                  # Step 7: get the load balancer address and call /hello
+./scripts/run-local.sh                 # 1.3  try the app on your Mac (Ctrl+C to stop)
+source ./scripts/env.sh                # 1.4  load settings into this terminal
+./scripts/push-to-ecr.sh v1            # 1.4  upload version v1 to ECR
+./scripts/create-cluster.sh            # 1.5  create the cluster (~15–20 min, starts billing)
+./scripts/deploy.sh v1                 # 1.6  run v1 on the cluster
+./scripts/test-app.sh                  # 1.7  call the live app
 
-./scripts/push-to-ecr.sh v2            # Step 8: after changing the code, push v2 ...
-./scripts/deploy.sh v2                 #         ... and roll it out
+./scripts/push-to-ecr.sh v2            # 1.8  after changing the code: upload v2 ...
+./scripts/deploy.sh v2                 #      ... and switch the cluster to it
 
-./scripts/clean-up.sh                  # Step 9: delete the app and the cluster when you're done
-./scripts/shut-down-docker.sh          # Step 9: stop containers and quit Docker Desktop
+./scripts/clean-up.sh                  # 1.9  delete the app and the cluster
+./scripts/shut-down-docker.sh          # 1.9  stop Docker on your Mac
 ```
-
-| Script | Step | What it does |
-|---|---|---|
-| `scripts/run-local.sh` | 3 | Build the jar and image, run the container on `localhost:8080` in the foreground |
-| `scripts/env.sh` | 4 | Set `AWS_REGION`, `ACCOUNT_ID`, `REPO`, `IMAGE_BASE` (use with `source`) |
-| `scripts/push-to-ecr.sh <tag>` | 4, 8 | Create the ECR repo if needed, log in, build a `linux/amd64` image, push it |
-| `scripts/create-cluster.sh` | 5 | Create `eks-sample-cluster` (skips if it exists) and point `kubectl` at it |
-| `scripts/deploy.sh <tag>` | 6, 8 | Apply `k8s/app.yaml` with that image tag and wait for the rollout |
-| `scripts/test-app.sh` | 7 | Get the load balancer address and call `/hello` |
-| `scripts/clean-up.sh` | 9 | Delete the app and the cluster, then list anything still billing |
-| `scripts/shut-down-docker.sh` | 9 | Stop running containers and quit Docker Desktop |
 
 ---
 
-## Step 1 — AWS credentials (IAM user, not root)
+## 1.1 Install the tools
 
-Never use root account access keys. Create a dedicated admin IAM user instead.
+| Tool | What it's for | Install (macOS) | Check it works |
+|---|---|---|---|
+| Java 21 + Maven | Build the app | `brew install openjdk@21 maven` | `java -version && mvn -v` |
+| Docker Desktop | Package and run the app | [docker.com](https://www.docker.com/products/docker-desktop/) | `docker info` |
+| AWS CLI v2 | Talk to AWS from the terminal | `brew install awscli` | `aws --version` |
+| eksctl | Create and delete EKS clusters | `brew tap eksctl-io/eksctl && brew install eksctl-io/eksctl/eksctl` | `eksctl version` |
+| kubectl | Talk to Kubernetes | `brew install kubectl` | `kubectl version --client` |
+| GitHub CLI (Part 2) | Work with GitHub from the terminal | `brew install gh` | `gh auth status` |
 
-**In the AWS Console (signed in as root, one last time):**
+> Use a **release** build of eksctl (a plain version number), not a `-dev` build.
 
+---
+
+## 1.2 Connect your Mac to AWS
+
+**What:** creates a safe everyday login for AWS. Never use the account's *root* (owner) keys.
+
+**In the AWS Console** (signed in as root, one last time):
 1. **IAM → Users → Create user** → name it `naveen-admin`.
 2. **Attach policies directly** → select **AdministratorAccess** → **Create user**.
 3. Open the user → **Security credentials** → **Create access key** → use case **CLI** → **download the .csv** (the secret is shown only once).
 4. Turn on **MFA for the root user** (account menu → Security credentials), then sign out of root for good.
 
-**On your Machine(laptop):**
+**On your Mac:**
 
 ```bash
 aws configure
-#   Access Key ID:      <from the csv>
-#   Secret Access Key:  <from the csv>
+#   Access Key ID:      (from the csv)
+#   Secret Access Key:  (from the csv)
 #   Default region:     us-west-1
 #   Output format:      json
 
-aws sts get-caller-identity   # ARN should end in user/naveen-admin, not root
+aws sts get-caller-identity   # should end in user/naveen-admin, not root
 ```
 
 ---
 
-## Step 2 — The Spring Boot app
+## 1.3 Run the app on your Mac
 
-**`pom.xml`** — Spring Boot 3.5, Java 21, with `web` and `actuator`:
+**What:** builds the app, packs it into a Docker image, and runs it on your Mac, so you can see it work before anything touches AWS.
 
-```xml
-<parent>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-parent</artifactId>
-    <version>3.5.6</version>
-</parent>
-
-<dependencies>
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-</dependencies>
-```
-
-**`EksDeploySampleApplication.java`** — returns a message, a version, and the pod's hostname, so you can see which replica answered:
-
-```java
-@SpringBootApplication
-@RestController
-public class EksDeploySampleApplication {
-
-    public static void main(String[] args) {
-        SpringApplication.run(EksDeploySampleApplication.class, args);
-    }
-
-    @GetMapping("/hello")
-    public Map<String, String> hello() throws Exception {
-        return Map.of(
-                "message", "Hello from EKS",
-                "version", "v1",
-                "pod", InetAddress.getLocalHost().getHostName());
-    }
-}
-```
-
-**`application.yml`** — turns on separate liveness/readiness endpoints for Kubernetes:
-
-```yaml
-spring:
-  application:
-    name: eks_deploy_sample                   # App name used in logs and actuator info
-server:
-  port: 8080                          # HTTP port (matches containerPort in k8s/app.yaml)
-  shutdown: graceful                  # Finish in-flight requests before shutting down on pod termination
-management:
-  endpoint:
-    health:
-      probes:
-        enabled: true                 # Separate liveness/readiness endpoints for Kubernetes probes
-  endpoints:
-    web:
-      exposure:
-        include: health,info          # Expose only health and info actuator endpoints over HTTP
-```
-
-**Build and run locally:**
+**Before you start:** open Docker Desktop and wait until it says it's running.
 
 ```bash
-mvn clean package -DskipTests
-java -jar target/eks_deploy_sample.jar
+./scripts/run-local.sh                 # or: PORT=9090 ./scripts/run-local.sh if 8080 is busy
+```
 
-# in another terminal
+In a second terminal:
+
+```bash
 curl localhost:8080/hello
 curl localhost:8080/actuator/health/readiness
 ```
 
----
+**You should see:** something like `{"greeting":"Hello from EKS ...","version":"v1","pod":"Your-Mac.local"}` and `{"status":"UP"}`.
 
-## Step 3 — Containerize with Docker
-
-**`Dockerfile`** (capital **D** — Linux CI is case-sensitive):
-
-```dockerfile
-FROM eclipse-temurin:21-jre
-WORKDIR /app
-COPY target/*.jar app.jar
-EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
-```
-
-Make sure Docker Desktop is running (`docker info` must show a healthy **Server** section).
-
-**Build and run the container locally with one command** — `scripts/run-local.sh` builds the jar, builds the image, and runs the container in the foreground:
-
-```bash
-#!/usr/bin/env bash
-# Build the jar, build the Docker image, and run the container in the foreground.
-# Usage: ./scripts/run-local.sh    (Ctrl+C to stop)
-set -euo pipefail                        # Exit on error, on unset variables, and on failures inside pipes
-
-IMAGE="eks-deploy-sample:local"          # Docker image name:tag to build and run
-PORT="${PORT:-8080}"                     # Host port; defaults to 8080, override with PORT=9090 ./scripts/run-local.sh
-
-cd "$(dirname "$0")/.."                  # Move to the project root (parent of scripts/) so pom.xml and Dockerfile are found
-
-echo "==> Building jar"                  # Progress message
-mvn clean package -DskipTests            # Delete old target/ and build a fresh jar, skipping tests
-
-echo "==> Building image $IMAGE"         # Progress message
-docker build -t "$IMAGE" .               # Build the image from the Dockerfile in this folder
-
-echo "==> Running $IMAGE on http://localhost:$PORT (Ctrl+C to stop)"  # Progress message
-exec docker run --rm -it -p "$PORT:8080" "$IMAGE"  # Run in foreground; --rm removes container on exit, -it attaches terminal, -p maps host port to container 8080
-```
-
-Run it (Docker Desktop must be running, and nothing else can be using port 8080, such as the `java -jar` run from Step 2):
-
-```bash
-chmod +x scripts/run-local.sh      # first time only
-./scripts/run-local.sh             # or: PORT=9090 ./scripts/run-local.sh
-
-# in another terminal
-curl localhost:8080/hello
-curl localhost:8080/actuator/health/readiness
-```
-
-Press `Ctrl+C` to stop; the container is removed automatically.
-
-> This local image is built for your Mac's CPU. The image pushed to EKS in Step 4 is built separately with `--platform linux/amd64`.
-
----
-
-## Step 4 — Push the image to ECR
-
-Steps 4–9 use a few shared variables. They live in **`scripts/env.sh`**:
-
-```bash
-# Shared settings for Steps 4–9. Load into the current terminal with: source ./scripts/env.sh
-# (must be sourced, not run as ./scripts/env.sh — a script can't set variables in your terminal)
-export AWS_REGION=us-west-1              # AWS region for ECR and EKS
-export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)  # AWS account ID of the current credentials
-export REPO=eks-deploy-sample            # ECR repository name
-export IMAGE_BASE=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO           # Image address without the tag
-
-echo "AWS_REGION=$AWS_REGION"            # Show the values so you can see they loaded
-echo "ACCOUNT_ID=$ACCOUNT_ID"
-echo "REPO=$REPO"
-echo "IMAGE_BASE=$IMAGE_BASE"
-```
-
-Load them into your terminal:
-
-```bash
-source ./scripts/env.sh     # IMAGE_BASE must NOT be blank
-```
-
-> **Variables only last for the current terminal tab.** In a new tab or window, or after a restart, run `source ./scripts/env.sh` again from the project folder before any later step. Otherwise commands like `--region $AWS_REGION` receive nothing and fail. (The Docker login to ECR is different: it's saved to disk and lasts about 12 hours.)
-
-**Build and push with one command.** `scripts/push-to-ecr.sh` creates the ECR repository if it doesn't exist yet, logs Docker in to ECR, builds the jar, builds a `linux/amd64` image, pushes it, and lists the tags in the repository:
-
-```bash
-#!/usr/bin/env bash
-# Build the jar, build a linux/amd64 image, and push it to Amazon ECR.
-# Usage: ./scripts/push-to-ecr.sh <tag>    (e.g. ./scripts/push-to-ecr.sh v1, ./scripts/push-to-ecr.sh v2, ./scripts/push-to-ecr.sh v3)
-set -euo pipefail                        # Exit on error, on unset variables, and on failures inside pipes
-
-TAG="${1:?Usage: ./scripts/push-to-ecr.sh <tag>  (e.g. ./scripts/push-to-ecr.sh v1)}"  # Image tag from the first argument (required); stops with the usage message if missing
-AWS_REGION="${AWS_REGION:-us-west-1}"    # AWS region; override with AWS_REGION=... ./scripts/push-to-ecr.sh
-REPO="${REPO:-eks-deploy-sample}"        # ECR repository name
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)  # AWS account ID of the current credentials
-REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"                 # ECR registry host for this account and region
-IMAGE="$REGISTRY/$REPO:$TAG"             # Full image address to build and push
-
-cd "$(dirname "$0")/.."                  # Move to the project root (parent of scripts/) so pom.xml and Dockerfile are found
-
-echo "==> Ensuring ECR repository $REPO exists"  # Progress message
-aws ecr describe-repositories --repository-names "$REPO" --region "$AWS_REGION" >/dev/null 2>&1 \
-  || aws ecr create-repository --repository-name "$REPO" --region "$AWS_REGION" >/dev/null  # Create the repo only if it's missing
-
-echo "==> Logging Docker in to $REGISTRY"        # Progress message
-aws ecr get-login-password --region "$AWS_REGION" \
-  | docker login --username AWS --password-stdin "$REGISTRY"  # Pipe a temporary ECR password into docker login
-
-echo "==> Building jar"                  # Progress message
-mvn clean package -DskipTests            # Delete old target/ and build a fresh jar, skipping tests
-
-echo "==> Building image $IMAGE"         # Progress message
-docker build --platform linux/amd64 -t "$IMAGE" .  # Build for x86 so it runs on the EKS nodes (even from an Apple Silicon Mac)
-
-echo "==> Pushing $IMAGE"                # Progress message
-docker push "$IMAGE"                     # Upload the image to ECR
-
-echo "==> Tags now in $REPO:"            # Progress message
-aws ecr list-images --repository-name "$REPO" --region "$AWS_REGION" \
-  --query 'imageIds[].imageTag' --output text  # List the tags in the repo to confirm the push
-```
-
-Run it:
-
-```bash
-chmod +x scripts/push-to-ecr.sh    # first time only
-./scripts/push-to-ecr.sh v1        # build and push $IMAGE_BASE:v1
-```
-
-The tag is required: pass `v1` now, and `v2`, `v3`, … for later releases (Step 8). Running it without a tag stops with a usage message. The last lines of output list the tags in ECR and should include `v1`.
+Press **Ctrl+C** in the first terminal to stop. The container is removed automatically.
 
 <details>
-<summary>The same steps run by hand</summary>
+<summary>What's inside: the app, its settings, and the Dockerfile</summary>
 
-```bash
-aws ecr create-repository --repository-name $REPO --region $AWS_REGION
-
-aws ecr get-login-password --region $AWS_REGION | \
-  docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-# → Login Succeeded
-
-mvn clean package -DskipTests
-docker build --platform linux/amd64 -t $IMAGE_BASE:v1 .
-docker push $IMAGE_BASE:v1
-
-aws ecr list-images --repository-name $REPO --region $AWS_REGION   # should list v1
-```
-
+- **`EksDeploySampleApplication.java`** — `/hello` returns a greeting, a version, and the name of the pod that answered, so you can see the load balancer spreading requests.
+- **`application.yml`** — runs on port 8080, shuts down gracefully, and turns on the `/actuator/health/liveness` and `/readiness` checks Kubernetes uses.
+- **`Dockerfile`** (capital **D**: Linux is case-sensitive):
+  ```dockerfile
+  FROM eclipse-temurin:21-jre
+  WORKDIR /app
+  COPY target/*.jar app.jar
+  EXPOSE 8080
+  ENTRYPOINT ["java", "-jar", "app.jar"]
+  ```
+- Without Docker: `mvn clean package -DskipTests && java -jar target/eks_deploy_sample.jar`
 </details>
-
-> `--platform linux/amd64` matters on Apple Silicon Macs: the EKS nodes are x86, and an ARM image fails with `exec format error`.
 
 ---
 
-## Step 5 — Create the EKS cluster
+## 1.4 Upload the app to AWS (ECR)
 
-> **New terminal?** Run `source ./scripts/env.sh` first (see Step 4).
+**What:** builds an image that runs on AWS's servers and uploads it to ECR with a version **tag** (`v1`, `v2`, …).
 
-**Pick an instance type your account allows.** New AWS accounts on the **Free plan** can only launch free-tier-eligible instance types. List them:
+**1. Load the shared settings into your terminal:**
 
 ```bash
-aws ec2 describe-instance-types --region $AWS_REGION \
+source ./scripts/env.sh     # prints AWS_REGION, ACCOUNT_ID, REPO, IMAGE_BASE; none should be blank
+```
+
+> These settings only last for the **current terminal tab**. In a new tab, run `source ./scripts/env.sh` again before any later step.
+
+**2. Build and upload version v1:**
+
+```bash
+./scripts/push-to-ecr.sh v1
+```
+
+The script creates the ECR repository if needed, logs Docker in to ECR, builds the image for AWS's servers (`linux/amd64`), and uploads it.
+
+**You should see:** the last line lists the tags in ECR, including `v1`.
+
+> **The tag is required.** Use a **new** tag for every release (`v1`, `v2`, `v3` …). Reusing a tag makes rollouts unreliable.
+
+---
+
+## 1.5 Create the Kubernetes cluster
+
+**What:** creates the servers and the Kubernetes service that will run the app. **Takes about 15–20 minutes and starts AWS billing** (about $0.10/hour for EKS, plus the 2 servers).
+
+**1. Pick a server type your account allows.** New accounts on AWS's **Free plan** can only use certain types. List them:
+
+```bash
+aws ec2 describe-instance-types --region us-west-1 \
   --filters Name=free-tier-eligible,Values=true \
   --query 'InstanceTypes[].[InstanceType,VCpuInfo.DefaultVCpus,MemoryInfo.SizeInMiB]' \
   --output table
 ```
 
-Choose the largest x86 option (for example `m7i-flex.large` or `c7i-flex.large`). Accounts on the Paid plan can use `t3.medium`.
+Pick the largest x86 option, for example `m7i-flex.large` (the default) or `c7i-flex.large`. Paid accounts can use `t3.medium`.
 
-**Create the cluster with one command** (~15–20 minutes). `scripts/create-cluster.sh` skips creation if the cluster already exists, runs `eksctl create cluster`, points `kubectl` at the cluster, and lists the nodes:
-
-```bash
-#!/usr/bin/env bash
-# Create the EKS cluster and managed node group with eksctl, then point kubectl at it (~15–20 min).
-# Usage: ./scripts/create-cluster.sh    (override with e.g. NODE_TYPE=c7i-flex.large ./scripts/create-cluster.sh)
-set -euo pipefail                        # Exit on error, on unset variables, and on failures inside pipes
-
-AWS_REGION="${AWS_REGION:-us-west-1}"    # AWS region; override with AWS_REGION=... ./scripts/create-cluster.sh
-CLUSTER="${CLUSTER:-eks-sample-cluster}" # EKS cluster name
-NODEGROUP="${NODEGROUP:-eks-nodes}"     # Managed node group name
-NODE_TYPE="${NODE_TYPE:-m7i-flex.large}" # EC2 instance type for worker nodes (must be free-tier eligible on the Free plan)
-NODES="${NODES:-2}"                      # Number of worker nodes to start with
-
-if aws eks describe-cluster --name "$CLUSTER" --region "$AWS_REGION" >/dev/null 2>&1; then  # Skip creation if the cluster already exists
-  echo "==> Cluster $CLUSTER already exists in $AWS_REGION, skipping create"                 # Progress message
-else
-  echo "==> Creating cluster $CLUSTER in $AWS_REGION with $NODES x $NODE_TYPE (~15–20 min)"  # Progress message
-  eksctl create cluster \
-    --name "$CLUSTER" \
-    --region "$AWS_REGION" \
-    --nodegroup-name "$NODEGROUP" \
-    --node-type "$NODE_TYPE" \
-    --nodes "$NODES" --nodes-min 1 --nodes-max 3 \
-    --managed                            # Build VPC, control plane, and a managed node group via CloudFormation
-fi
-
-echo "==> Pointing kubectl at $CLUSTER"  # Progress message
-aws eks update-kubeconfig --name "$CLUSTER" --region "$AWS_REGION"  # Write/refresh the cluster entry in ~/.kube/config
-
-echo "==> Nodes:"                        # Progress message
-kubectl get nodes                        # Should list the worker nodes with STATUS Ready
-```
-
-Run it, passing the instance type you chose above:
+**2. Create the cluster:**
 
 ```bash
-chmod +x scripts/create-cluster.sh                         # first time only
-./scripts/create-cluster.sh       # run the script
+./scripts/create-cluster.sh                                # uses m7i-flex.large
+NODE_TYPE=c7i-flex.large ./scripts/create-cluster.sh       # or choose another type
 ```
+
+**You should see:** at the end, `kubectl get nodes` lists **2 nodes** with STATUS **Ready**.
+
+- Running it again is safe: if the cluster exists, it skips creation and just reconnects `kubectl`.
+- A yellow `[!]` warning about **OIDC** / `vpc-cni` is safe to ignore.
 
 <details>
-<summary>The same command run by hand</summary>
+<summary>What gets created</summary>
 
-```bash
-eksctl create cluster \
-  --name eks-sample-cluster \
-  --region $AWS_REGION \
-  --nodegroup-name demo-nodes \
-  --node-type m7i-flex.large \
-  --nodes 2 --nodes-min 1 --nodes-max 3 \
-  --managed
-```
-
+A private network (VPC), the Kubernetes control plane, 2 servers (EC2 *nodes*), Kubernetes' core add-ons, and an entry in `~/.kube/config` so `kubectl` talks to the new cluster.
 </details>
 
-What this builds, via CloudFormation:
-- A VPC with public and private subnets
-- The EKS control plane (the Kubernetes API)
-- A managed node group of 2 EC2 worker nodes
-- Core add-ons: `vpc-cni`, `coredns`, `kube-proxy`
-- An entry in `~/.kube/config` so `kubectl` points at the new cluster
-
-> The yellow `[!]` warning about **OIDC** and `vpc-cni` is safe to ignore.
-
-**Verify:** the script ends with `kubectl get nodes`, which should show 2 nodes with STATUS `Ready`. To check again later:
-
-```bash
-kubectl get nodes
-```
-
-If `kubectl` can't reach the cluster, run `./scripts/create-cluster.sh` again. It skips creation and just refreshes `~/.kube/config`. Or run the command directly:
-```bash
-aws eks update-kubeconfig --name eks-sample-cluster --region $AWS_REGION
-```
-
 ---
 
-## Step 6 — Deploy to Kubernetes
+## 1.6 Deploy the app to the cluster
 
-> **New terminal?** Run `source ./scripts/env.sh` first (see Step 4).
+**What:** tells Kubernetes to run a version of your app, using the instructions in `k8s/app.yaml`.
 
-**`k8s/app.yaml`:**
-
-```yaml
-apiVersion: apps/v1                     # API group/version for Deployments
-kind: Deployment                        # Manages a replicated set of pods
-metadata:                               # Deployment identity
-  name: eks-deploy-sample                       # Deployment name
-spec:                                   # Desired state
-  replicas: 2                           # Run two pods
-  selector:                             # How the Deployment finds its pods
-    matchLabels: { app: eks-deploy-sample }     # Match pods labeled app=eks-deploy-sample
-  template:                             # Pod template
-    metadata:                           # Pod metadata
-      labels: { app: eks-deploy-sample }        # Label that the selector matches
-    spec:                               # Pod spec
-      containers:                       # Containers in the pod
-        - name: eks-deploy-sample               # Container name
-          image: IMAGE_URI              # Placeholder replaced with the ECR image at deploy time
-          ports: [{ containerPort: 8080 }]  # Spring Boot listens on 8080
-          resources:                    # CPU/memory sizing
-            requests: { cpu: "250m", memory: "512Mi" }  # Guaranteed minimum for scheduling
-            limits:   { memory: "768Mi" }  # Memory cap on pod
-          readinessProbe:               # Gate traffic until app is ready
-            httpGet: { path: /actuator/health/readiness, port: 8080 }  # Actuator readiness endpoint
-            initialDelaySeconds: 20     # Wait 20s before first check
-          livenessProbe:                # Restart container if unhealthy
-            httpGet: { path: /actuator/health/liveness, port: 8080 }  # Actuator liveness endpoint
-            initialDelaySeconds: 40     # Wait 40s before first check
----
-apiVersion: v1                          # Core API version for Services
-kind: Service                           # Stable network endpoint for the pods
-metadata:                               # Service identity
-  name: eks-deploy-sample-svc                   # Service name
-spec:                                   # Desired state
-  type: LoadBalancer                    # Provision an AWS load balancer
-  selector: { app: eks-deploy-sample }          # Route to pods labeled app=eks-deploy-sample
-  ports: [{ port: 80, targetPort: 8080 }]  # Expose port 80, forward to container 8080
+```bash
+./scripts/deploy.sh v1
 ```
 
-What each part does:
+**You should see:** after 1–2 minutes, 2 pods at `1/1 Running`, and a Service whose `EXTERNAL-IP` is a long `...elb.amazonaws.com` address (it may say `<pending>` for a minute).
 
-| Piece | Purpose |
+> The version must already be in ECR (uploaded in 1.4).
+
+<details>
+<summary>What <code>k8s/app.yaml</code> asks for, in plain words</summary>
+
+| Part | Plain meaning |
 |---|---|
-| `Deployment` | Keeps 2 replicas of the app running and handles rolling updates |
-| `image: IMAGE_URI` | Placeholder, filled in at deploy time with the real ECR address |
-| `resources` | Reserves CPU/memory so the scheduler places pods on nodes with room |
-| `readinessProbe` | A pod receives traffic only after `/actuator/health/readiness` returns UP |
-| `livenessProbe` | Kubernetes restarts the container if `/actuator/health/liveness` fails |
-| `Service` (`LoadBalancer`) | AWS creates a public load balancer: port 80 → pod port 8080 |
+| **Deployment**, 2 replicas | Always keep 2 copies (pods) of the app running; replace any that crash |
+| `image: IMAGE_URI` | Which version to run. `deploy.sh` fills in the real ECR address and tag. |
+| `resources` | How much CPU and memory each copy needs |
+| `readinessProbe` | Only send visitors to a copy once `/actuator/health/readiness` says UP |
+| `livenessProbe` | Restart a copy if `/actuator/health/liveness` stops answering |
+| **Service**, `LoadBalancer` | Create a public AWS load balancer: port 80 → the app's port 8080 |
 
-> Kubernetes resource and container names can't contain underscores, so the manifest uses `eks-deploy-sample` even though the project is `eks_deploy_sample`.
-
-**Deploy with one command.** You don't paste the manifest into the terminal. `scripts/deploy.sh` reads `k8s/app.yaml`, replaces `IMAGE_URI` with the ECR image address, applies it, waits for the rollout, and shows the pods and the Service:
-
-```bash
-#!/usr/bin/env bash
-# Deploy k8s/app.yaml to the cluster with the ECR image filled in, and wait for the rollout.
-# Usage: ./scripts/deploy.sh <tag>    (e.g. ./scripts/deploy.sh v1, ./scripts/deploy.sh v2, ./scripts/deploy.sh v3)
-set -euo pipefail                        # Exit on error, on unset variables, and on failures inside pipes
-
-TAG="${1:?Usage: ./scripts/deploy.sh <tag>  (e.g. ./scripts/deploy.sh v1)}"  # Image tag from the first argument (required); stops with the usage message if missing
-AWS_REGION="${AWS_REGION:-us-west-1}"    # AWS region; override with AWS_REGION=... ./scripts/deploy.sh
-REPO="${REPO:-eks-deploy-sample}"        # ECR repository name
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)  # AWS account ID of the current credentials
-IMAGE="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO:$TAG"          # Full image address to deploy
-
-cd "$(dirname "$0")/.."                  # Move to the project root (parent of scripts/) so k8s/app.yaml is found
-
-echo "==> Deploying $IMAGE"              # Progress message
-sed "s|IMAGE_URI|$IMAGE|" k8s/app.yaml | kubectl apply -f -  # Replace the IMAGE_URI placeholder and apply the manifest
-
-echo "==> Waiting for rollout"           # Progress message
-kubectl rollout status deployment/eks-deploy-sample --timeout=5m  # Block until all pods are updated and ready (fail after 5 min)
-
-echo "==> Pods:"                         # Progress message
-kubectl get pods -l app=eks-deploy-sample  # Should show 2 pods at 1/1 Running
-
-echo "==> Service:"                      # Progress message
-kubectl get svc eks-deploy-sample-svc    # EXTERNAL-IP is the load balancer hostname (may show <pending> for a minute)
-```
-
-Run it:
-
-```bash
-chmod +x scripts/deploy.sh     # first time only
-./scripts/deploy.sh v1         # deploy $IMAGE_BASE:v1
-```
-
-The tag is required and must already be in ECR (pushed with `./scripts/push-to-ecr.sh <tag>`).
-
-Both pods should reach `1/1 Running` within about 1–2 minutes. The Service's `EXTERNAL-IP` may show `<pending>` for a minute while AWS creates the load balancer.
-
-<details>
-<summary>The same steps run by hand</summary>
-
-```bash
-sed "s|IMAGE_URI|$IMAGE_BASE:v1|" k8s/app.yaml | kubectl apply -f -
-kubectl rollout status deployment/eks-deploy-sample
-kubectl get pods
-```
-
+Don't run `kubectl apply -f k8s/app.yaml` directly: the `IMAGE_URI` placeholder would give `InvalidImageName`. Always use `deploy.sh`.
 </details>
 
 ---
 
-## Step 7 — Test v1
+## 1.7 Test it
 
-**Test with one command.** `scripts/test-app.sh` gets the load balancer address and calls `/hello`:
-
-```bash
-#!/usr/bin/env bash
-# Get the load balancer address and call /hello.
-# Usage: ./scripts/test-app.sh
-set -euo pipefail                        # Exit on error, on unset variables, and on failures inside pipes
-
-URL=$(kubectl get svc eks-deploy-sample-svc \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')  # Load balancer hostname of the Service
-echo $URL                                # Show the address
-curl -sSf --retry 10 --retry-delay 15 --retry-all-errors http://$URL/hello  # Call /hello; retry for ~2.5 min, and fail if it never answers
-echo                                     # Newline after the JSON response
-```
-
-Run it:
+**What:** finds the load balancer's public address and calls the live app.
 
 ```bash
-chmod +x scripts/test-app.sh   # first time only
 ./scripts/test-app.sh
 ```
 
-<details>
-<summary>The same steps run by hand</summary>
-
-```bash
-export URL=$(kubectl get svc eks-deploy-sample-svc \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-echo $URL
-curl http://$URL/hello
-```
-
-</details>
-
-Expected response:
+**You should see:** the address, then a reply such as:
 
 ```json
-{"message":"Hello from EKS","version":"v1","pod":"eks-deploy-sample-cc445fbd6-4pzg7"}
+{"greeting":"Hello from EKS ...","version":"v1","pod":"eks-deploy-sample-cc445fbd6-4pzg7"}
 ```
 
-- Right after the first deploy, the load balancer's DNS name can take 2–3 minutes to start working. The script retries for about 2.5 minutes and exits with an error if `/hello` never answers, which is what lets the CI/CD pipeline (Step 10) detect a broken deploy.
-- Run it several times: the `pod` value alternates between the two replicas, which shows the load balancer spreading traffic.
+- Right after the first deploy, the address can take **2–3 minutes** to start working. The script keeps retrying for about 2.5 minutes, and fails if the app never answers.
+- Run it a few times: the `pod` name changes between the two copies. That's the load balancer sharing the work.
 
-**Where to see it in the AWS console** (region **us-west-1**):
-- **The Service:** EKS → Clusters → `eks-sample-cluster` → **Resources** → Service and networking → Services → `eks-deploy-sample-svc`. You must be signed in as the IAM user that created the cluster (`naveen-admin`), not root.
-- **The load balancer it created:** EC2 → Load Balancers. It has a generated name. Match its **DNS name** to `$URL`, or look for the tag `kubernetes.io/service-name = default/eks-deploy-sample-svc`.
+**See it in the AWS console** (region **us-west-1**, signed in as `naveen-admin`, not root):
+- **The app's Service:** EKS → Clusters → `eks-sample-cluster` → **Resources** → Service and networking → Services → `eks-deploy-sample-svc`.
+- **The load balancer:** EC2 → Load Balancers. Its **DNS name** matches the address the script printed.
 
 ---
 
-## Step 8 — Roll out v2
+## 1.8 Release a new version
 
-> **New terminal?** Run `source ./scripts/env.sh` first (see Step 4).
+**What:** ships a change with **zero downtime**: Kubernetes swaps the copies one at a time and only sends visitors to a new copy once it's healthy.
 
-**1. Change the code** in `EksDeploySampleApplication.java`:
+**1. Change the code** in `src/main/java/com/example/eksdeploysample/EksDeploySampleApplication.java`, for example:
 
 ```java
-"message", "Hello from EKS - updated!",
+"greeting", "Hello from EKS - updated!",
 "version", "v2",
 ```
 
-**2. Build and push under a new tag:**
-
-```bash
-./scripts/push-to-ecr.sh v2
-```
-
-**3. Point the Deployment at v2:**
-
-```bash
-./scripts/deploy.sh v2
-```
-
-For later releases, repeat with `v3`, `v4`, … .
-
-**4. Watch the switch live.** In a second terminal, start this *before* step 3 (Ctrl+C to stop):
+**2. (Optional) Watch it switch live.** In a second terminal:
 
 ```bash
 export URL=$(kubectl get svc eks-deploy-sample-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 echo $URL    # must NOT be blank
-while true; do curl -s http://$URL/hello; echo; sleep 1; done
+while true; do curl -s http://$URL/hello; echo; sleep 1; done      # Ctrl+C to stop
 ```
 
-Responses flip from `v1` to `v2` with no failed requests. This is a **rolling update**: Kubernetes starts a v2 pod, waits for its readiness probe to pass, sends it traffic, and only then retires a v1 pod, one at a time.
+**3. Upload and deploy the new version:**
 
-Or, once the rollout finishes, run `./scripts/test-app.sh` and check that the response says `v2`.
+```bash
+./scripts/push-to-ecr.sh v2
+./scripts/deploy.sh v2
+```
 
-**Roll back** if v2 misbehaves:
+**You should see:** the replies change from `v1` to `v2` with no errors in between.
+
+**Undo** if the new version misbehaves:
 
 ```bash
 kubectl rollout undo deployment/eks-deploy-sample
-kubectl rollout history deployment/eks-deploy-sample
 ```
 
-> Always push a **new tag** for each release (`v1`, `v2`, …). Reusing a tag makes rollouts and rollbacks unreliable.
+> **Use the same tag on both commands.** `push-to-ecr.sh` only uploads; the cluster only changes when you run `deploy.sh` with that tag.
 
 ---
 
-## Step 9 — Clean up
+## 1.9 Clean up (stop paying)
 
-> **New terminal?** Run `source ./scripts/env.sh` first (see Step 4).
-
-EKS bills for the control plane (~$0.10/hour) plus the EC2 nodes and the load balancer. Delete everything when you're done.
-
-**Clean up with one command.** `scripts/clean-up.sh` deletes the app first (so the load balancer is removed cleanly), then the cluster, and finally lists any clusters or load balancers still in the region:
+**What:** deletes the app, its load balancer, and the cluster, then checks nothing is left that costs money.
 
 ```bash
-#!/usr/bin/env bash
-# Delete the app, the load balancer, and the EKS cluster, then check nothing is left billing.
-# Usage: ./scripts/clean-up.sh
-set -euo pipefail                        # Exit on error, on unset variables, and on failures inside pipes
-
-AWS_REGION="${AWS_REGION:-us-west-1}"    # AWS region; override with AWS_REGION=... ./scripts/clean-up.sh
-CLUSTER="${CLUSTER:-eks-sample-cluster}" # EKS cluster name
-REPO="${REPO:-eks-deploy-sample}"        # ECR repository name
-
-cd "$(dirname "$0")/.."                  # Move to the project root (parent of scripts/) so k8s/app.yaml is found
-
-echo "==> Deleting the app and its load balancer"  # Progress message
-kubectl delete -f k8s/app.yaml --ignore-not-found  # Remove the Deployment and Service first, so AWS deletes the load balancer cleanly
-
-echo "==> Deleting cluster $CLUSTER (~10–15 min)"  # Progress message
-eksctl delete cluster --name "$CLUSTER" --region "$AWS_REGION" --wait  # Delete the cluster, node group, and VPC
-
-# Optional: also delete the ECR repository and all its images (uncomment to use)
-# aws ecr delete-repository --repository-name "$REPO" --force --region "$AWS_REGION"
-
-echo "==> Remaining clusters (should be empty):"  # Progress message
-aws eks list-clusters --region "$AWS_REGION" --query 'clusters' --output text  # Any EKS clusters still in the region
-
-echo "==> Remaining load balancers (should be empty):"  # Progress message
-aws elb describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancerDescriptions[].LoadBalancerName' --output text  # Classic load balancers
-aws elbv2 describe-load-balancers --region "$AWS_REGION" --query 'LoadBalancers[].LoadBalancerName' --output text          # Application/network load balancers
+./scripts/clean-up.sh          # ~10–15 min
 ```
 
-Run it:
+**You should see:** the "Remaining clusters" and "Remaining load balancers" sections print nothing.
+
+- The images in ECR are **kept** (storage costs very little). To delete them too, uncomment the `aws ecr delete-repository` line in `scripts/clean-up.sh`.
+- Part 2's pipeline needs the cluster. After deleting it, CD deploys fail until you recreate it (and redo step 6 of 2.2).
+
+**Stop Docker on your Mac** when you're done:
 
 ```bash
-chmod +x scripts/clean-up.sh   # first time only
-./scripts/clean-up.sh
-```
-
-The "Remaining" sections at the end should print nothing. The ECR repository and its images are kept, since storing them costs very little. To delete them too, uncomment the `aws ecr delete-repository` line in the script, or run it by hand.
-
-<details>
-<summary>The same steps run by hand</summary>
-
-```bash
-# 1. Remove the app first, so the load balancer is deleted cleanly
-kubectl delete -f k8s/app.yaml
-
-# 2. Delete the cluster, node group and VPC (~10–15 min)
-eksctl delete cluster --name eks-sample-cluster --region $AWS_REGION --wait
-
-# 3. Optional: delete the image repository
-aws ecr delete-repository --repository-name $REPO --force --region $AWS_REGION
-
-# Confirm nothing is left billing
-aws eks list-clusters --region $AWS_REGION                         # "clusters": []
-aws elb   describe-load-balancers --region $AWS_REGION --query 'LoadBalancerDescriptions[].LoadBalancerName'
-aws elbv2 describe-load-balancers --region $AWS_REGION --query 'LoadBalancers[].LoadBalancerName'
-```
-
-</details>
-
-**Shut down Docker** when you no longer need it. `scripts/shut-down-docker.sh` stops any running containers and quits Docker Desktop:
-
-```bash
-#!/usr/bin/env bash
-# Stop all running containers and quit Docker Desktop.
-# Usage: ./scripts/shut-down-docker.sh
-
-docker stop $(docker ps -q)              # Stop every running container (e.g. the one from run-local.sh)
-osascript -e 'quit app "Docker"'         # Quit Docker Desktop, which also stops the Docker engine
-```
-
-Run it:
-
-```bash
-chmod +x scripts/shut-down-docker.sh   # first time only
 ./scripts/shut-down-docker.sh
 ```
 
-Optionally, reclaim disk space from old images first with `docker system prune -a`.
+---
+
+## Part 1 troubleshooting
+
+| Problem | Why | Fix |
+|---|---|---|
+| `SignatureDoesNotMatch` on any `aws` command | The secret key doesn't match the access key | Check `env | grep AWS` for overrides (`unset` them), check `cat -e ~/.aws/credentials` for stray characters, or create a new access key and run `aws configure` again |
+| `500 Internal Server Error ... docker.sock` | Docker Desktop's engine isn't healthy | `osascript -e 'quit app "Docker"'; sleep 5; open -a Docker`, then wait for "running". Still stuck: Docker Desktop → Troubleshoot → Restart. |
+| `bind: address already in use` from `run-local.sh` | Something else uses port 8080, often an earlier `java -jar` | `lsof -nP -iTCP:8080 -sTCP:LISTEN` to find it, then stop it, or use `PORT=9090 ./scripts/run-local.sh` |
+| `argument --region: expected one argument` | This terminal doesn't have the settings | `source ./scripts/env.sh` |
+| `zsh: parse error near '\n'` | A pasted command still had a `<...>` placeholder | Replace the whole placeholder, brackets included, with the real value |
+| `zsh: bad substitution` | Bash-only syntax pasted into zsh | Use the zsh form, or run it with `bash -c '...'` |
+| Pods show `InvalidImageName` | The image address was blank | Run `./scripts/deploy.sh <tag>` again |
+| Pods show `ErrImagePull` / `ImagePullBackOff` | That tag isn't in ECR | Check with `aws ecr list-images --repository-name eks-deploy-sample --region us-west-1`, push it with `./scripts/push-to-ecr.sh <tag>`, then deploy again |
+| `test-app.sh` says `Empty reply from server` | No healthy pod behind the load balancer | `kubectl get pods`: both should be `1/1 Running`. Fix the pods first. |
+| Cluster creation stuck in `CREATING`, then times out | Usually AWS refusing the server type (Free plan) | See below |
+
+**Finding why cluster creation failed.** CloudTrail keeps 90 days of AWS history, even after the cluster is deleted. Put your own times in place of the two example times:
+
+```bash
+aws cloudtrail lookup-events --region us-west-1 \
+  --start-time 2026-09-30T18:00:00Z --end-time 2026-09-30T20:00:00Z --output json | python3 -c '
+import json, sys
+for e in json.load(sys.stdin)["Events"]:
+    d = json.loads(e["CloudTrailEvent"])
+    if "errorCode" in d:
+        print(d["eventTime"], d["eventSource"], d["eventName"], d["errorCode"], d.get("errorMessage", "")[:200])'
+```
+
+Our root cause was `RunInstances → "The specified instance type is not eligible for Free Tier."` Fix: pick a free-tier-eligible type (1.5) or upgrade the account to the Paid plan. A `--dry-run` test does **not** catch this.
+
+**Handy commands:**
+
+```bash
+kubectl get pods -w                           # live pod status (Ctrl+C to stop)
+kubectl describe pod POD_NAME | tail -20      # why a pod won't start
+kubectl logs POD_NAME                         # the app's own log
+kubectl get events --sort-by=.lastTimestamp   # recent cluster events
+```
 
 ---
 
-## Step 10 — CI/CD with GitHub Actions
+# Part 2 — CI/CD pipeline: automatic test and deploy
 
-Once this is set up, nobody runs the scripts by hand. The team workflow becomes:
+Once this is set up, **nobody runs the Part 1 scripts by hand**. A developer opens a pull request, GitHub checks it, a teammate reviews it, and merging it ships it to production, with an email either way.
+
+## 2.1 How the pipeline works
 
 ```
-feature branch ──▶ pull request ──▶ CI: build + test + image build ──▶ peer review ──▶ merge to main
-                                                                                            │
-   email alert ◀── roll back ◀── (any failure or timeout) ◀── CD: push ─▶ deploy ─▶ smoke test ─▶ success email
+ feature branch ──▶ pull request ──▶ CI: build + test ──▶ review ──▶ merge to main
+                          │                                               │
+                    CI fails? email,                                     CD: upload ─▶ deploy ─▶ test
+                    merge is blocked                                      │
+                                                     works? "Deploy succeeded" email
+                                                     fails? roll back + "Deploy FAILED" email
 ```
 
-| Workflow | Runs when | What it does |
+| | **CI** (`.github/workflows/ci.yml`) | **CD** (`.github/workflows/cd.yml`) |
 |---|---|---|
-| `.github/workflows/ci.yml` | A pull request targets `main` | `mvn verify` (compile + tests) and `docker build`. Nothing is pushed or deployed. On failure: a "CI FAILED" email via SNS. |
-| `.github/workflows/cd.yml` | Code lands on `main` (a merged PR) | `push-to-ecr.sh`, `deploy.sh`, `test-app.sh` using the **commit ID** as the image tag (for example `3b2e6d0`). On success: a "Deploy succeeded" email via SNS. On failure or timeout: `kubectl rollout undo`, then a "Deploy FAILED" email via SNS. |
+| **Runs when** | A pull request to `main` is opened or updated | A pull request is merged into `main` |
+| **Does** | Builds the app, runs the tests, builds the Docker image | Uploads the image to ECR, deploys it, tests the live app |
+| **Uploads or deploys?** | No | Yes |
+| **On success** | The PR can be merged | "Deploy succeeded" email |
+| **On failure** | The PR can't be merged; "CI FAILED" email | Rolls back to the last good version; "Deploy FAILED" email |
 
-- **The cluster must already be running** (Step 5). CD deploys to it but never creates or deletes it.
-- **Image tag = commit ID.** Every image in ECR maps to exactly one commit, so tags never collide between developers.
-- **One deploy at a time.** If two PRs merge close together, the second deploy waits for the first.
-- **Time limits:** build and push 15 min, deploy 10 min, smoke test 5 min. Going over a limit counts as a failure, so it triggers the rollback and the email.
-- **Emails go to the SNS subscribers** (step 4), on success and on failure. The one exception: if the AWS login itself fails, SNS can't be reached, so no SNS email is sent. GitHub's own "workflow failed" email covers that case. It goes to your GitHub account's notification email (see step 9).
+**Good to know:**
+- **The cluster must already exist** (Part 1, step 1.5). CD deploys to it but never creates or deletes it.
+- **Version tag = commit ID** (like `3c43352`), set automatically. Every image in ECR matches exactly one commit, so developers never clash over `v1`/`v2`.
+- **One deploy at a time.** If two PRs are merged close together, the second waits.
+- **Time limits:** upload 15 min, deploy 10 min, live test 5 min. Running over counts as a failure.
+- **No AWS passwords are stored in GitHub.** Each run gets short-lived AWS access through **OIDC** (a trust link between GitHub and AWS).
+- **Where to watch:** the repo's **Actions** tab on GitHub.
 
-### One-time setup (by hand)
+---
 
-GitHub logs in to AWS with **OIDC**: each run gets short-lived credentials for one IAM role, so no AWS keys are stored in GitHub. Run these from the project folder in one terminal, in order.
+## 2.2 One-time setup
 
-**1. Set variables for the setup commands.**
+Do these in order, in **one terminal**, from the project folder. Steps 2–9 are done **once**. Only step 6 is repeated, each time you recreate the cluster.
+
+**1. Set the names used below.**
 
 ```bash
 export AWS_REGION=us-west-1
@@ -803,7 +463,7 @@ export ALERT_EMAIL=naveenkrishnan99@yahoo.com
 echo "$ACCOUNT_ID"    # must NOT be blank
 ```
 
-**2. Let AWS trust GitHub's login service.** This is done once per AWS account.
+**2. Let AWS trust GitHub's login service** (once per AWS account).
 
 ```bash
 aws iam create-open-id-connect-provider \
@@ -811,17 +471,17 @@ aws iam create-open-id-connect-provider \
   --client-id-list sts.amazonaws.com
 ```
 
-> If it says the provider already exists, that's fine; move on. If it asks for a thumbprint, add `--thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1`.
-> Console alternative: IAM → Identity providers → Add provider → OpenID Connect, URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
+> "Already exists" is fine. If it asks for a thumbprint, add `--thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1`.
+> In the console: IAM → Identity providers → Add provider → OpenID Connect, URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
 
-**3. Create the IAM role GitHub will use.** Only workflows running on this repo's `main` branch can assume it.
+**3. Create the deploy role** that CD uses. Only runs on this repo's `main` branch can use it.
 
-First, ask GitHub exactly how it identifies this repo when logging in (the *subject* prefix). Newer repos use an **immutable** format that includes the owner and repo ID numbers, such as `repo:naveenkrishnan01@1700446/EKS_DEPLOY_DEMO@1396760023`. Older ones use `repo:naveenkrishnan01/EKS_DEPLOY_DEMO`. The trust rule must match it exactly.
+GitHub identifies the repo with a *subject*. Newer repos include ID numbers (for example `repo:naveenkrishnan01@1700446/EKS_DEPLOY_DEMO@1396760023`), and the role must match it exactly. Ask GitHub for it:
 
 ```bash
 export SUB_PREFIX=$(gh api "repos/${GH_REPO}/actions/oidc/customization/sub" --jq '.sub_claim_prefix // empty')
 export SUB_PREFIX=${SUB_PREFIX:-repo:${GH_REPO}}
-echo "$SUB_PREFIX"    # e.g. repo:naveenkrishnan01@1700446/EKS_DEPLOY_DEMO@1396760023
+echo "$SUB_PREFIX"
 ```
 
 Then create the role:
@@ -846,10 +506,10 @@ EOF
 
 aws iam create-role --role-name "$ROLE_NAME" \
   --assume-role-policy-document file:///tmp/gha-trust.json \
-  --query Role.Arn --output text          # prints the role ARN
+  --query Role.Arn --output text
 ```
 
-**4. Create the SNS topic and subscribe your email.**
+**4. Create the email alerts topic** and subscribe the alert address.
 
 ```bash
 export TOPIC_ARN=$(aws sns create-topic --name eks-deploy-alerts --region "$AWS_REGION" --query TopicArn --output text)
@@ -859,9 +519,9 @@ aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol email \
   --notification-endpoint "$ALERT_EMAIL" --region "$AWS_REGION"
 ```
 
-**Open the "AWS Notification - Subscription Confirmation" email and click _Confirm subscription_.** No alerts are delivered until you do. Check the spam folder if it isn't in your inbox.
+**Then open the "AWS Notification - Subscription Confirmation" email and click _Confirm subscription_.** No alerts arrive until you do. Check Spam too.
 
-**5. Give the role only the permissions the pipeline needs.** That means pushing to the one ECR repository, finding the cluster, and publishing to the one SNS topic.
+**5. Give the deploy role only what CD needs:** upload to the one ECR repository, find the cluster, and send to the one alerts topic.
 
 ```bash
 cat > /tmp/gha-permissions.json <<EOF
@@ -887,48 +547,29 @@ aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name eks-deploy-pipeli
   --policy-document file:///tmp/gha-permissions.json
 ```
 
-**6. Allow the role to deploy inside the cluster.** It can edit resources in the `default` namespace only.
+**6. Let the deploy role into the cluster.** The cluster must be running. **Repeat this every time you recreate the cluster.**
 
 ```bash
+# Should print API or API_AND_CONFIG_MAP
+aws eks describe-cluster --name "$CLUSTER" --region "$AWS_REGION" --query cluster.accessConfig.authenticationMode --output text
+
+# Add the role to the cluster's access list
 aws eks create-access-entry --cluster-name "$CLUSTER" --region "$AWS_REGION" \
   --principal-arn "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
+# Allow it to change apps in the "default" area (namespace) only
 aws eks associate-access-policy --cluster-name "$CLUSTER" --region "$AWS_REGION" \
   --principal-arn "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
   --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy \
   --access-scope type=namespace,namespaces=default
 ```
 
-> **Repeat this step whenever you recreate the cluster.** Access entries belong to the cluster, so `clean-up.sh` removes them along with it. Steps 2–5 and 7–8 don't need repeating.
-> If `create-access-entry` says the cluster's authentication mode doesn't support it, enable access entries first, then rerun step 6:
-> `aws eks update-cluster-config --name "$CLUSTER" --region "$AWS_REGION" --access-config authenticationMode=API_AND_CONFIG_MAP`
+> If the first command prints `CONFIG_MAP`, run `aws eks update-cluster-config --name "$CLUSTER" --region "$AWS_REGION" --access-config authenticationMode=API_AND_CONFIG_MAP`, wait a minute, then continue.
+> In the console: EKS → `eks-sample-cluster` → **Access** tab → **Create access entry**, role ARN, policy `AmazonEKSEditPolicy`, scope *Kubernetes Namespace* `default`.
 
-**7. Tell GitHub the role and topic.** These are repository *variables*, not secrets: ARNs aren't passwords.
-
-```bash
-gh variable set AWS_ROLE_ARN  --repo "$GH_REPO" --body "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
-gh variable set SNS_TOPIC_ARN --repo "$GH_REPO" --body "$TOPIC_ARN"
-gh variable list --repo "$GH_REPO"       # both should be listed
-```
-
-(Or in the browser: repo **Settings → Secrets and variables → Actions → Variables → New repository variable**.)
-
-**8. Protect `main` so code only gets there through a reviewed PR with passing CI.** In the browser:
-repo **Settings → Branches → Add branch ruleset** (or *Add classic branch protection rule*) for `main`:
-- **Require a pull request before merging**, with required approvals set to **1**
-- **Require status checks to pass**, and add the check **`build`**. It only appears in the list after CI has run once, so open one PR first.
-- **Block force pushes**
-
-> Working solo? GitHub doesn't let you approve your own PR. Set required approvals to **0** until there's a second reviewer, but keep the status check required.
-
-**9. Email alerts for failed CI builds.** CI runs pull-request code that hasn't been reviewed yet, so it gets its **own role that can only publish to the alerts topic**. It has no ECR or cluster access.
+**7. Create the alerts-only role** that CI uses to email failures. CI runs code nobody has reviewed yet, so this role can **only send to the alerts topic**: no ECR, no cluster.
 
 ```bash
-export CI_ROLE_NAME=github-actions-ci-alerts
-export TOPIC_ARN=arn:aws:sns:${AWS_REGION}:${ACCOUNT_ID}:eks-deploy-alerts
-export SUB_PREFIX=$(gh api "repos/${GH_REPO}/actions/oidc/customization/sub" --jq '.sub_claim_prefix // empty')
-export SUB_PREFIX=${SUB_PREFIX:-repo:${GH_REPO}}
-
 cat > /tmp/gha-ci-trust.json <<EOF
 {
   "Version": "2012-10-17",
@@ -953,332 +594,207 @@ cat > /tmp/gha-ci-permissions.json <<EOF
 }
 EOF
 
-aws iam create-role --role-name "$CI_ROLE_NAME" \
+aws iam create-role --role-name github-actions-ci-alerts \
   --assume-role-policy-document file:///tmp/gha-ci-trust.json --query Role.Arn --output text
-aws iam put-role-policy --role-name "$CI_ROLE_NAME" --policy-name ci-alerts-only \
+aws iam put-role-policy --role-name github-actions-ci-alerts --policy-name ci-alerts-only \
   --policy-document file:///tmp/gha-ci-permissions.json
 ```
 
-Then add a third GitHub variable (Settings → Secrets and variables → Actions → Variables):
-- `CI_ALERT_ROLE_ARN` = `arn:aws:iam::<account-id>:role/github-actions-ci-alerts`, the ARN printed by `create-role`.
+**8. Tell GitHub the three names.** Repo → **Settings** → **Secrets and variables** → **Actions** → **Variables** tab → **New repository variable**, once for each. They're *variables*, not secrets: these names aren't passwords.
 
-> The trust rule ends in `:pull_request` instead of `:ref:refs/heads/main`, so this role is only usable by pull-request runs, and the deploy role is still only usable from `main`. Pull requests from forks never get AWS access: GitHub doesn't give them an OIDC token.
+| Name | Value |
+|---|---|
+| `AWS_ROLE_ARN` | `arn:aws:iam::<your account ID>:role/github-actions-eks-deploy` |
+| `SNS_TOPIC_ARN` | `arn:aws:sns:us-west-1:<your account ID>:eks-deploy-alerts` |
+| `CI_ALERT_ROLE_ARN` | `arn:aws:iam::<your account ID>:role/github-actions-ci-alerts` |
 
-**10. Where emails go.**
-
-| Email | Sent by | Goes to |
-|---|---|---|
-| **CI FAILED** (a PR's build or tests fail) | SNS, from CI | the SNS subscriber from step 4 (`naveenkrishnan99@yahoo.com`) |
-| **Deploy succeeded** / **Deploy FAILED** | SNS, from CD | the SNS subscriber from step 4 |
-| GitHub's own "workflow failed" | GitHub | your GitHub account's notification email (here `naveenkrishnan01@gmail.com`) |
-
-- SNS emails come from **no-reply@sns.amazonaws.com**. If they don't show up, check Spam/Bulk, click **Not spam**, and add that address to your contacts.
-- GitHub's own email is the backup for the one case SNS can't cover: when the AWS login itself fails. To stop it, uncheck **Email** under **Settings → Notifications → System → Actions**, but then that case has no alert.
-
-### Try it
+Copy the names exactly, and make sure no space slips in before or after a value. From the terminal instead:
 
 ```bash
-git switch -c feature/new-message
-# edit the "message" text in EksDeploySampleApplication.java
-git commit -am "Change hello message"
-git push -u origin feature/new-message
-gh pr create --fill                       # CI runs on the PR; watch it in the PR's Checks tab
-gh pr merge --squash --delete-branch      # after review + green CI; CD starts on main
-gh run watch                              # follow the CD run live
-./scripts/test-app.sh                     # the new message, served by the image tagged with the commit ID
+gh variable set AWS_ROLE_ARN      --repo "$GH_REPO" --body "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+gh variable set SNS_TOPIC_ARN     --repo "$GH_REPO" --body "$TOPIC_ARN"
+gh variable set CI_ALERT_ROLE_ARN --repo "$GH_REPO" --body "arn:aws:iam::${ACCOUNT_ID}:role/github-actions-ci-alerts"
+gh variable list --repo "$GH_REPO"       # all three should be listed
 ```
 
-**Test the email alert without breaking anything:**
+**9. Protect `main`** so code only gets there through a pull request with passing CI. In the browser:
+
+1. Open one pull request first, so GitHub has seen the **`build`** check run.
+2. Repo → **Settings** → **Rules** → **Rulesets** → **New ruleset** → **New branch ruleset**.
+3. **Name:** `protect-main`. **Enforcement status:** Active. **Target branches:** Add target → *Include default branch*.
+4. Tick: **Restrict deletions**, **Require a pull request before merging** (required approvals **1**), **Require status checks to pass** → Add checks → **`build`**, **Block force pushes**.
+5. **Create**.
+
+> Working alone? GitHub won't let you approve your own pull request. Set required approvals to **0** until a second person joins, and keep the `build` check required.
+
+**Check everything works:**
 
 ```bash
 aws sns publish --topic-arn "$TOPIC_ARN" --region "$AWS_REGION" \
   --subject "Test alert" --message "If you can read this, deploy alerts work."
 ```
 
-### If CD fails
-
-| Error in the run log | Cause | Fix |
-|---|---|---|
-| `Could not assume role` / `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The trust policy's `sub` doesn't match what GitHub sends (most often the **immutable subject** format with ID numbers), the `AWS_ROLE_ARN` variable is wrong, or the run wasn't on `main` | Redo step 3 with `SUB_PREFIX` from `gh api`, or edit the trust policy in the console (IAM → Roles → role → Trust relationships). Check step 7. |
-| `You must be logged in to the server (Unauthorized)` | The role has no access entry in the cluster, for example after recreating it | Redo step 6 |
-| `AccessDenied ... sns:Publish` | The topic ARN in GitHub doesn't match the one in the permissions | Redo steps 5 and 7 with the same `TOPIC_ARN` |
-| `ResourceNotFoundException ... eks-sample-cluster` | The cluster isn't running | `./scripts/create-cluster.sh`, then step 6 |
-| CI's **Log in to AWS for the alert** fails | The `CI_ALERT_ROLE_ARN` variable is missing or wrong, or the CI role's trust rule doesn't end in `:pull_request` | Redo step 9 |
-| No SNS emails arrive, but the run log shows a `MessageId` | The email was delivered but filtered | Check Spam/Bulk for no-reply@sns.amazonaws.com |
+The email should arrive within a minute.
 
 ---
 
-## Step 11 — Demo: CI/CD in action
+## 2.3 Everyday use: making a change
 
-Three short scenarios that show the pipeline catching a bad change, then shipping good ones to the cluster.
+1. **Start a branch** from the latest `main`:
+   ```bash
+   git switch main && git pull
+   git switch -c my-change
+   ```
+2. **Make the change** and check it locally (optional): `mvn -q verify`.
+3. **Push and open a pull request:**
+   ```bash
+   git commit -am "Describe the change"
+   git push -u origin my-change
+   gh pr create --fill
+   ```
+4. **Wait for CI** to show a green **build** check on the PR (`gh pr checks --watch`). A red check blocks the merge and sends a "CI FAILED" email.
+5. **Review and merge** on GitHub (**Merge pull request** → **Confirm merge**), or `gh pr merge --squash --delete-branch`.
+6. **CD runs by itself.** Watch it in the **Actions** tab or with `gh run watch`. When it's done, you get a "Deploy succeeded" email and `./scripts/test-app.sh` shows the change.
+
+**What runs where:** CI and CD run on GitHub's own temporary computers, not on your Mac. Nothing appears in Docker Desktop. The only lasting copy of each image is the one CD uploads to **your** ECR, tagged with the commit ID.
+
+---
+
+## 2.4 Email alerts
+
+| Email | When | Sent by | Goes to |
+|---|---|---|---|
+| **CI FAILED** | A pull request's build or tests fail | SNS (from CI) | `naveenkrishnan99@yahoo.com` |
+| **Deploy succeeded** | CD deployed and the live test passed | SNS (from CD) | `naveenkrishnan99@yahoo.com` |
+| **Deploy FAILED** | CD failed or timed out (and rolled back) | SNS (from CD) | `naveenkrishnan99@yahoo.com` |
+| GitHub's "workflow failed" | Any failed run | GitHub | your GitHub account email (`naveenkrishnan01@gmail.com`) |
+
+- SNS emails come from **no-reply@sns.amazonaws.com**. If they're missing, look in **Spam/Bulk**, mark one **Not spam**, and add the address to your contacts.
+- GitHub's own email is the backup for the one case SNS can't cover: when the AWS login itself fails. It's controlled in GitHub → **Settings** → **Notifications** → **Actions**.
+- To change where SNS emails go: AWS console → **SNS** → Topics → `eks-deploy-alerts` → **Create subscription** (Email) for the new address, confirm it, then delete the old subscription.
+
+---
+
+## 2.5 Demo: three scenarios
+
+Shows the pipeline **blocking a bad change**, then **shipping good ones** to production.
 
 **Before the demo:**
-- The cluster is running (`./scripts/create-cluster.sh`) and Step 10's step 6 has been done on it.
-- Your local `main` is up to date: `git switch main && git pull`.
-- Open two terminals in the project folder. **Terminal 2** is for watching the live app.
+- The cluster is running (`./scripts/create-cluster.sh`) and step 6 of 2.2 has been done on it.
+- Two terminals open in the project folder. In **Terminal 2**, watch the live app (Ctrl+C to stop):
+  ```bash
+  export URL=$(kubectl get svc eks-deploy-sample-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+  echo $URL    # must NOT be blank
+  while true; do curl -s http://$URL/hello; echo; sleep 2; done
+  ```
+  It shows what production serves right now, for example `{"greeting":"Hello from EKS ...","version":"v1","pod":"..."}`.
 
-In **Terminal 2**, start watching the app before you begin (Ctrl+C to stop):
+### Scenario 1 — Code changes but the test doesn't: CI fails, merge is blocked
 
-```bash
-export URL=$(kubectl get svc eks-deploy-sample-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-echo $URL    # must NOT be blank
-while true; do curl -s http://$URL/hello; echo; sleep 2; done
-```
+**Goal:** show broken code can't reach production.
 
-It shows what production serves right now, for example `{"message":"Hello from EKS updating this!!","version":"v1","pod":"..."}`.
+1. Create the branch:
+   ```bash
+   git switch main && git pull
+   git switch -c feature-a
+   ```
+2. In `src/main/java/com/example/eksdeploysample/EksDeploySampleApplication.java`, rename the reply's **key** from `"greeting"` to `"reply"`. Leave the test file alone: it still expects `"greeting"`.
+   ```java
+   "reply", "Hello from EKS ...",
+   ```
+   > Changing only the **text** wouldn't fail: the test checks that the key exists, not the wording.
+3. (Optional) See it fail locally: `mvn -q verify`.
+4. Push and open a PR:
+   ```bash
+   git commit -am "Rename greeting to reply (test not updated)"
+   git push -u origin feature-a
+   gh pr create --fill
+   ```
+5. **Show:** the PR's **build** check turns red ❌ and **Merge** is disabled. The failed check's **Build and test** log says:
+   ```
+   [/hello should return a message]
+   Expecting actual: "{"reply":"Hello from EKS ...", ...}" to contain: ""greeting""
+   ```
+   A **"CI FAILED"** email arrives. **Terminal 2 is unchanged**: nothing was deployed.
+
+### Scenario 2 — Fix the test: CI passes, CD deploys, the change is live
+
+**Goal:** show the same PR going green and reaching production by itself.
+
+1. On the same branch, in `src/test/java/com/example/eksdeploysample/EksDeploySampleApplicationTests.java`, make the test expect the new key:
+   ```java
+   assertThat(response.getBody()).as("/hello should return a reply").contains("\"reply\"");
+   ```
+2. Push the fix:
+   ```bash
+   git commit -am "Update test for reply key"
+   git push
+   gh pr checks --watch        # build: pass
+   ```
+3. Merge (button on GitHub, or `gh pr merge --squash --delete-branch`), then watch CD: `gh run watch`.
+4. **Show:**
+   - **Terminal 2** changes from `{"greeting": ...}` to `{"reply": ...}` with no errors in between.
+   - `./scripts/test-app.sh` returns the new reply.
+   - A **"Deploy succeeded"** email arrives with the commit ID.
+   - The running version equals the merge commit:
+     ```bash
+     git switch main && git pull && git log --oneline -1
+     kubectl get deploy eks-deploy-sample -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+     ```
+
+### Scenario 3 — An everyday change: the new pods serve the latest code
+
+**Goal:** show the normal flow end to end, with proof that **new** pods replaced the old ones.
+
+1. Note the current pods: `kubectl get pods -l app=eks-deploy-sample` (names and AGE).
+2. New branch and change:
+   ```bash
+   git switch main && git pull
+   git switch -c feature-b
+   ```
+   ```java
+   "reply", "Hello from EKS - deployed by CI/CD!",
+   "version", "v4",
+   ```
+   No test change needed: the key is still `"reply"`.
+3. Push, open the PR, wait for green, merge:
+   ```bash
+   git commit -am "New reply text, version v4"
+   git push -u origin feature-b
+   gh pr create --fill
+   gh pr checks --watch
+   gh pr merge --squash --delete-branch
+   gh run watch
+   ```
+4. **Show:**
+   - **Terminal 2** switches to `{"reply":"Hello from EKS - deployed by CI/CD!","version":"v4", ...}`.
+   - `kubectl get pods -l app=eks-deploy-sample` shows **new** pod names with a young AGE.
+   - The `pod` in each reply matches one of those new names.
+   - A second **"Deploy succeeded"** email.
+
+**After the demo:** Ctrl+C in Terminal 2, then `./scripts/clean-up.sh`.
 
 ---
 
-### Use case 1 — A code change without a matching test update: CI fails and the merge is blocked
+## Part 2 troubleshooting
 
-**Goal:** show that broken code can't reach `main`.
-
-**1. Create the branch:**
-
-```bash
-git switch main && git pull
-git switch -c feature-3
-```
-
-**2. Change the code but not the test.** In `src/main/java/com/example/eksdeploysample/EksDeploySampleApplication.java`, rename the JSON key `"message"` to `"greeting"`:
-
-```java
-// before
-"message", "Hello from EKS updating this!!",
-// after
-"greeting", "Hello from EKS updating this!!",
-```
-
-Leave `EksDeploySampleApplicationTests.java` alone. It still expects a `"message"` key.
-
-**3. (Optional) See it fail locally first:**
-
-```bash
-mvn -q verify     # fails: [/hello should return a message] ... to contain "message"
-```
-
-**4. Push and open a pull request:**
-
-```bash
-git commit -am "Rename message to greeting (test not updated)"
-git push -u origin feature-3
-gh pr create --fill
-```
-
-**5. Show the result:**
-
-```bash
-gh pr checks --watch        # build: fail
-```
-
-On GitHub, the PR's **Checks** show **CI / build ❌**, and the **Merge** button is disabled ("Required status check build has failed"). Open the failed check → **Build and test** to show the reason:
-
-```
-[/hello should return a message]
-Expecting actual: "{"greeting":"Hello from EKS ...", ...}" to contain: ""message""
-```
-
-Try to merge from the terminal. It's refused:
-
-```bash
-gh pr merge --squash        # refused: the required check has failed
-```
-
-**What this proves:** CI caught the mismatch. Nothing was pushed to ECR or deployed, and **Terminal 2 still shows `"message"`**.
-
----
-
-### Use case 2 — Fix the test: CI passes, CD deploys, and `curl` shows the change
-
-**Goal:** show the same PR going green and reaching production automatically.
-
-**1. Update the test to match the code.** On the same `feature-3` branch, in `src/test/java/com/example/eksdeploysample/EksDeploySampleApplicationTests.java`:
-
-```java
-// before
-assertThat(response.getBody()).as("/hello should return a message").contains("\"message\"");
-// after
-assertThat(response.getBody()).as("/hello should return a greeting").contains("\"greeting\"");
-```
-
-```bash
-mvn -q verify               # optional: passes locally now
-git commit -am "Update test for greeting key"
-git push
-```
-
-**2. CI runs again on the PR:**
-
-```bash
-gh pr checks --watch        # build: pass
-```
-
-The **Merge** button is enabled now.
-
-**3. Merge. This starts CD:**
-
-```bash
-gh pr merge --squash --delete-branch
-gh run watch                # pick the "CD" run: push → deploy → smoke test → email
-```
-
-**4. Show the change in production:**
-- **Terminal 2** flips from `{"message": ...}` to `{"greeting": ...}`. During the rolling update you may see both for a few seconds, and never an error.
-- Run the smoke test yourself:
-  ```bash
-  ./scripts/test-app.sh       # {"greeting":"Hello from EKS updating this!!", ...}
-  ```
-- **Email:** "Deploy succeeded" arrives at naveenkrishnan99@yahoo.com with the commit ID.
-- **ECR:** a new image tagged with the merge commit ID:
-  ```bash
-  git switch main && git pull
-  git log --oneline -1        # e.g. 4f2a9c1
-  kubectl get deploy eks-deploy-sample -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
-  # ...eks-deploy-sample:4f2a9c1  ← same ID
-  ```
-
----
-
-### Use case 3 — Another change on a new branch: CI/CD succeeds and the new pods serve it
-
-**Goal:** show the everyday flow end to end, with proof that the **new pods** have the latest code.
-
-**1. Note the current pods** (old version):
-
-```bash
-kubectl get pods -l app=eks-deploy-sample      # note the pod names and AGE
-```
-
-**2. Create the branch and change the code:**
-
-```bash
-git switch main && git pull
-git switch -c feature-4
-```
-
-In `EksDeploySampleApplication.java`, change the text and the version:
-
-```java
-"greeting", "Hello from EKS - deployed by CI/CD!",
-"version", "v4",
-```
-
-No test change is needed, because the test checks that the `"greeting"` key exists, not its wording.
-
-**3. Push, open the PR, and wait for green CI:**
-
-```bash
-git commit -am "New greeting, version v4"
-git push -u origin feature-4
-gh pr create --fill
-gh pr checks --watch        # build: pass
-```
-
-**4. Merge and watch CD:**
-
-```bash
-gh pr merge --squash --delete-branch
-gh run watch
-```
-
-**5. Show the latest change is live:**
-- **Terminal 2** switches to `{"greeting":"Hello from EKS - deployed by CI/CD!","version":"v4", ...}` with no failed requests.
-- New pods replaced the old ones, with different names and a young AGE:
-  ```bash
-  kubectl get pods -l app=eks-deploy-sample
-  ```
-- The `pod` value in each response matches one of those **new** pod names:
-  ```bash
-  ./scripts/test-app.sh
-  ```
-- The running image tag equals the latest commit on `main`:
-  ```bash
-  git switch main && git pull && git log --oneline -1
-  kubectl get deploy eks-deploy-sample -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
-  ```
-- **Email:** a second "Deploy succeeded" with the new commit ID.
-
-**After the demo:** stop Terminal 2 (Ctrl+C), then `./scripts/clean-up.sh` to delete the cluster so it stops costing money.
-
----
-
-## Troubleshooting (issues we actually hit)
-
-### `SignatureDoesNotMatch` on `aws sts get-caller-identity`
-The secret key in `~/.aws/credentials` doesn't match the access key ID.
-- Check for overriding variables: `env | grep AWS` (clear them with `unset`).
-- Inspect the file for stray characters: `cat -e ~/.aws/credentials`. The `$` at each line end is just `cat -e` marking the line end; `^M` or a space before `$` is a problem.
-- Most reliable fix: create a new access key for the IAM user and run `aws configure` again.
-
-### Docker: `500 Internal Server Error ... docker.sock`
-The Docker **engine** isn't healthy (`docker info` shows the client, but the Server section errors).
-```bash
-osascript -e 'quit app "Docker"'; sleep 5; open -a Docker
-```
-Wait for "Docker Desktop is running". If it persists, use Troubleshoot → Restart in Docker Desktop, restart the Mac, or update Docker Desktop.
-
-### `bind: address already in use` from `run-local.sh`
-Something else on your Mac is using port 8080, usually the `java -jar` app from Step 2 that's still running. Find it:
-```bash
-lsof -nP -iTCP:8080 -sTCP:LISTEN
-```
-Stop it (Ctrl+C in its terminal, or `kill <PID>` using the PID shown), or run the container on another port: `PORT=9090 ./scripts/run-local.sh`.
-
-### `zsh: parse error near '\n'`
-A command was pasted with a `<...>` placeholder still in it. zsh reads `<` and `>` as redirection. Replace the whole placeholder, brackets included, with the real value.
-
-### `zsh: bad substitution` or odd `!` behavior
-Some bash-only syntax, such as `${!v}`, doesn't work in zsh, and zsh expands `!` in pasted commands from your history. Use the zsh form or run the command with `bash -c '...'`.
-
-### EKS node group stuck in `CREATING`, then eksctl times out
-Symptoms: `describe-nodegroup` shows `CREATING` with no health issues and no EC2 instances launch.
-**Find the real error in CloudTrail**, which keeps 90 days of API history even after the cluster is deleted:
-
-```bash
-aws cloudtrail lookup-events --region us-west-1 \
-  --start-time <UTC start> --end-time <UTC end> --output json | python3 -c '
-import json, sys
-for e in json.load(sys.stdin)["Events"]:
-    d = json.loads(e["CloudTrailEvent"])
-    if "errorCode" in d:
-        print(d["eventTime"], d["eventSource"], d["eventName"], d["errorCode"], d.get("errorMessage", "")[:200])'
-```
-
-Replace `<UTC start>` and `<UTC end>` with real times, for example `2026-09-30T18:00:00Z`. Pasting the `<...>` text as-is causes a shell parse error.
-
-Our root cause: `RunInstances → "The specified instance type is not eligible for Free Tier."` The account was on the **Free plan** and `t3.medium` isn't eligible. **Fix:** use a free-tier-eligible type (Step 5) or upgrade the account to the Paid plan.
-
-> An `aws ec2 run-instances --dry-run` test does **not** catch this restriction, so it can report "would have succeeded" even though real launches are refused.
-
-### `aws: error: argument --region: expected one argument`
-`$AWS_REGION` is empty because this terminal doesn't have the Step 4 variables. Run `source ./scripts/env.sh` from the project folder and try again.
-
-### Pods show `InvalidImageName`
-The image address was blank because `$IMAGE_BASE` wasn't set in the current terminal. Check it:
-```bash
-kubectl get deployment eks-deploy-sample -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
-```
-Run `./scripts/deploy.sh` again, which works out the image address itself.
-
-### Pods show `ErrImagePull` / `ImagePullBackOff`
-The address is valid, but the tag isn't in ECR. Confirm with `aws ecr list-images --repository-name eks-deploy-sample`, push the missing tag, then force an immediate retry:
-```bash
-kubectl delete pod <pod-name>
-```
-
-### Handy diagnostics
-```bash
-kubectl get pods -w                             # live pod status
-kubectl describe pod <name> | tail -20          # Events explain pull / scheduling errors
-kubectl logs <name>                             # Spring Boot startup output
-kubectl get events --sort-by=.lastTimestamp     # cluster-wide recent events
-```
+| Problem (in the Actions log) | Why | Fix |
+|---|---|---|
+| `refusing to allow an OAuth App to create or update workflow` when pushing | Your GitHub login can't change workflow files yet | `gh auth refresh -h github.com -s workflow`, enter the code in the browser, push again |
+| `Could not assume role` / `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The role's trust rule doesn't match GitHub's subject (usually the ID-number format), the `AWS_ROLE_ARN` variable is wrong (check for a space), or the run wasn't on `main` | Redo step 3 with `SUB_PREFIX`, or in the console: IAM → Roles → role → **Trust relationships** → edit the `sub` line. Check step 8. |
+| `You must be logged in to the server (Unauthorized)` | The cluster doesn't know the deploy role, usually after recreating it | Redo step 6 |
+| `ResourceNotFoundException ... eks-sample-cluster` | The cluster isn't running | `./scripts/create-cluster.sh`, then step 6 |
+| `AccessDenied ... sns:Publish` | The topic in GitHub doesn't match the role's permission | Redo steps 5 and 8 with the same topic |
+| CI's **Log in to AWS for the alert** fails | `CI_ALERT_ROLE_ARN` missing or wrong, or the CI role's trust doesn't end in `:pull_request` | Redo steps 7 and 8 |
+| Run log shows a `MessageId` but no email arrived | The email was delivered but filtered | Check Spam/Bulk for no-reply@sns.amazonaws.com |
+| Failure email arrived at Gmail, not Yahoo | That was GitHub's own notification, not SNS | Expected. SNS emails go to Yahoo (see 2.4). |
+| Can't merge your own PR | Required approvals is 1 and you're working alone | Step 9: set required approvals to 0 for now |
 
 ---
 
 ## Next things to do
 
-- **AWS Load Balancer Controller + Ingress** — an ALB with path-based routing and HTTPS
-- **Staging before production** — deploy to a staging namespace first, then promote the same image to prod with an approval
-- **Pod Identity / IRSA** — give pods scoped IAM permissions to call S3, DynamoDB, etc.
-- **Horizontal Pod Autoscaler** — scale replicas automatically on CPU load
+- **Staging before production** — deploy to a staging area first, then promote the same image to production with an approval
+- **AWS Load Balancer Controller + Ingress** — a modern load balancer with HTTPS and path-based routing
+- **Pod Identity / IRSA** — let the app call other AWS services (S3, DynamoDB) with its own limited permissions
+- **Horizontal Pod Autoscaler** — add or remove copies automatically as traffic changes
